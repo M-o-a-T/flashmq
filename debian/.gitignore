@@ -1,0 +1,7 @@
+/.debhelper/
+/files
+/*.substvars
+/*.debhelper
+/*.log
+/flashmq/
+/*-stamp

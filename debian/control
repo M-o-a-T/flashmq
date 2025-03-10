@@ -1,0 +1,21 @@
+Source: flashmq
+Section: net
+Priority: optional
+Maintainer: Matthias Urlichs <matthias@urlichs.de>
+Rules-Requires-Root: no
+Build-Depends:
+ debhelper-compat (= 13),
+ cmake,
+Standards-Version: 4.7.0
+Homepage: https://flashmq.org
+Vcs-Git: https://github.com/halfgaar/FlashMQ
+
+Package: flashmq
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Description: A high-performance, light-weight MQTT broker/server.
+ FlashMQ is a high-performance, light-weight MQTT broker/server, designed to
+ take good advantage of multi-CPU environments.
+
