@@ -19,3 +19,11 @@ Description: A high-performance, light-weight MQTT broker/server.
  FlashMQ is a high-performance, light-weight MQTT broker/server, designed to
  take good advantage of multi-CPU environments.
 
+Package: flashmq-dev
+Architecture: all
+Description: A high-performance, light-weight MQTT broker/server, development file
+ FlashMQ is a high-performance, light-weight MQTT broker/server, designed to
+ take good advantage of multi-CPU environments.
+ .
+ This package includes the header file required for plugin development.
+
