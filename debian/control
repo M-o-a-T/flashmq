@@ -15,13 +15,13 @@ Architecture: any
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
-Description: A high-performance, light-weight MQTT broker/server.
+Description: High-performance, light-weight MQTT broker/server.
  FlashMQ is a high-performance, light-weight MQTT broker/server, designed to
  take good advantage of multi-CPU environments.
 
 Package: flashmq-dev
 Architecture: all
-Description: A high-performance, light-weight MQTT broker/server, development file
+Description: High-performance, light-weight MQTT broker/server, development file
  FlashMQ is a high-performance, light-weight MQTT broker/server, designed to
  take good advantage of multi-CPU environments.
  .
