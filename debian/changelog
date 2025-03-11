@@ -1,4 +1,4 @@
-flashmq (1.20-1) unstable; urgency=medium
+flashmq (1.20.0-1) unstable; urgency=medium
 
   * Initial release. (Closes: #1100047)
 
