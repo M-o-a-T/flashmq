@@ -4,4 +4,6 @@
 /*.debhelper
 /*.log
 /flashmq/
+/flashmq-dev/
+/tmp/
 /*-stamp

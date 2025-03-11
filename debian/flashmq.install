@@ -1,0 +1,3 @@
+etc/flashmq/flashmq.conf
+lib/systemd/system/flashmq.service usr/lib/systemd/system/
+usr/bin/flashmq usr/bin
