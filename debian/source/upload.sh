@@ -3,9 +3,8 @@ set -ex
 
 git checkout debian
 
-B="$(git describe --tags | sed -e s/-.*//)"
+B="$(git describe --tags --match "v*" main | sed -e s/-.*//)"
 test -n "$B"
-git push salsa $B debian
 
 
 D="$(git describe --tags --exact-match debian || echo '')"
@@ -14,12 +13,4 @@ if test -z "$D" ; then
 	D="$(git describe --tags --exact-match debian)"
 fi
 test -n "$D"
-git push salsa $D
-
-T=$(tempfile)
-rm -f $T
-mkdir $T
-cd $T
-trap 'cat overall.log; cd /; rm -rf $T' 0 1 2 15
-
-DGIT_DRS_EMAIL_NOREPLY=smurf@debian.org dgit-repos-server debian . /usr/share/keyrings/debian-keyring.gpg,a --tag2upload https://salsa.debian.org/smurf/flashmq.git "$D"
+git push salsa $B $D
