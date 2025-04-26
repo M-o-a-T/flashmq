@@ -1,3 +1,10 @@
+flashmq (1.20.0-2) unstable; urgency=medium
+
+  * Add preinst to create /var/lib/flashmq
+  * log to stdout (= journal)
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Sat, 26 Apr 2025 18:03:20 +0200
+
 flashmq (1.20.0-1) unstable; urgency=medium
 
   * Initial release. (Closes: #1100047)
