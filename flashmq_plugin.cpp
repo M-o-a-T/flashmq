@@ -9,6 +9,7 @@ See LICENSE for license details.
 */
 
 #include "flashmq_plugin.h"
+#include "flashmq_plugin_deprecated.h"
 
 #include "logger.h"
 #include "threaddata.h"
@@ -27,6 +28,9 @@ void flashmq_logf(int level, const char *str, ...)
     va_end(valist);
 }
 
+/**
+ * @brief flashmq_plugin_remove_client for previous plugin versions.
+ */
 void flashmq_plugin_remove_client(const std::string &clientid, bool alsoSession, ServerDisconnectReasons reasonCode)
 {
     std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
@@ -52,20 +56,80 @@ void flashmq_plugin_remove_client(const std::string &clientid, bool alsoSession,
     }
 }
 
-void flashmq_plugin_remove_subscription(const std::string &clientid, const std::string &topicFilter)
+void flashmq_plugin_remove_client_v4(const std::weak_ptr<Session> &session, bool alsoSession, ServerDisconnectReasons reasonCode)
 {
     std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    if (!store) return;
+    std::shared_ptr<Session> session_locked = session.lock();
+    if (!session_locked) return;
+    std::shared_ptr<Client> client = session_locked->makeSharedClient();
+    if (!client) return;
+    std::shared_ptr<ThreadData> td = client->lockThreadData();
+    if (!td) return;
+
+    ReasonCodes _code = static_cast<ReasonCodes>(reasonCode);
+    td->serverInitiatedDisconnect(client, _code, "Removed from plugin");
+
+    if (alsoSession)
+        store->removeSession(session_locked);
+}
+
+/**
+ * @brief flashmq_plugin_remove_subscription for previous plugin versions.
+ */
+void flashmq_plugin_remove_subscription(const std::string &clientid, const std::string &topicFilter)
+{
+    if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
+        throw std::runtime_error("Unsubscribing from plugin failed: invalid topic filter: " + topicFilter);
+
+    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
     std::shared_ptr<Session> session = store->lockSession(clientid);
+    if (!session) return;
 
-    if (session)
-    {
-        std::shared_ptr<Client> client = session->makeSharedClient();
+    std::vector<std::string> subtopics = splitTopic(topicFilter);
+    std::string shareName;
+    std::string _;
+    parseSubscriptionShare(subtopics, shareName, _);
 
-        if (client)
-        {
-            store->removeSubscription(client, topicFilter);
-        }
-    }
+    store->removeSubscription(session, subtopics, shareName);
+}
+
+void flashmq_plugin_remove_subscription_v4(const std::weak_ptr<Session> &session, const std::string &topicFilter)
+{
+    if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
+        throw std::runtime_error("Unsubscribing from plugin failed: invalid topic filter: " + topicFilter);
+
+    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<Session> session_locked = session.lock();
+    if (!session_locked) return;
+
+    std::vector<std::string> subtopics = splitTopic(topicFilter);
+    std::string shareName;
+    std::string _;
+    parseSubscriptionShare(subtopics, shareName, _);
+
+    store->removeSubscription(session_locked, subtopics, shareName);
+}
+
+bool flashmq_plugin_add_subscription(
+    const std::weak_ptr<Session> &session, const std::string &topicFilter, uint8_t qos, bool noLocal, bool retainAsPublished,
+    const uint32_t subscriptionIdentifier)
+{
+    if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
+        throw std::runtime_error("Subscribing from plugin failed: invalid topic filter: " + topicFilter);
+
+    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    if (!store) return false;
+    std::shared_ptr<Session> session_locked = session.lock();
+    if (!session_locked) return false;
+
+    std::vector<std::string> subtopics = splitTopic(topicFilter);
+    std::string shareName;
+    std::string topicDummy;
+    parseSubscriptionShare(subtopics, shareName, topicDummy);
+
+    const AddSubscriptionType result = store->addSubscription(session_locked, subtopics, qos, noLocal, retainAsPublished, shareName, subscriptionIdentifier);
+    return result == AddSubscriptionType::Invalid ? false : true;
 }
 
 void flashmq_continue_async_authentication(const std::weak_ptr<Client> &client, AuthResult result, const std::string &authMethod, const std::string &returnData)
@@ -195,4 +259,21 @@ void flashmq_remove_task(uint32_t id)
         return;
 
     d->removeDelayedTask(id);
+}
+
+void flashmq_get_session_pointer(const std::string &clientid, const std::string &username, std::weak_ptr<Session> &sessionOut)
+{
+    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    if (!store) return;
+    std::shared_ptr<Session> session = store->lockSession(clientid);
+    if (!session) return;
+    if (session->getUsername() != username) return;
+    sessionOut = session;
+}
+
+void flashmq_get_client_pointer(const std::weak_ptr<Session> &session, std::weak_ptr<Client> &clientOut)
+{
+    std::shared_ptr<Session> sessionLocked = session.lock();
+    if (!sessionLocked) return;
+    clientOut = sessionLocked->makeSharedClient();
 }

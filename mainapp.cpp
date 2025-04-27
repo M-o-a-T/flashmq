@@ -108,7 +108,7 @@ void MainApp::showLicense()
 #endif
 
     printf("FlashMQ Version %s %s\n", FLASHMQ_VERSION, sse.c_str());
-    puts("Copyright (C) 2021-2024 Wiebe Cazemier.");
+    puts("Copyright (C) 2021-2025 Wiebe Cazemier.");
     puts("License OSL3: Open Software License 3.0 <https://opensource.org/license/osl-3-0-php/>.");
     puts("");
     puts("Author: Wiebe Cazemier <wiebe@flashmq.org>");
@@ -625,10 +625,10 @@ void MainApp::start()
             websocketsubscriber->setFakeUpgraded();
             subscriptionStore->registerClientAndKickExistingOne(websocketsubscriber);
             subtopics = splitTopic("#");
-            subscriptionStore->addSubscription(websocketsubscriber, subtopics, 0, false, false, empty, 0);
+            subscriptionStore->addSubscription(websocketsubscriber->getSession(), subtopics, 0, false, false, empty, 0);
 
             subscriptionStore->registerClientAndKickExistingOne(subscriber);
-            subscriptionStore->addSubscription(subscriber, subtopics, 0, false, false, empty, 0);
+            subscriptionStore->addSubscription(subscriber->getSession(), subtopics, 0, false, false, empty, 0);
 
             if (fuzzWebsockets && strContains(fuzzFilePathLower, "upgrade"))
             {
@@ -681,8 +681,6 @@ void MainApp::start()
     sendBridgesToThreads();
     queueBridgeReconnectAllThreads(true);
 
-    uint next_thread_index = 0;
-
     this->bgWorker.start();
 
     struct epoll_event events[MAX_EVENTS];
@@ -717,7 +715,7 @@ void MainApp::start()
                     if (!listener)
                         continue;
 
-                    std::shared_ptr<ThreadData> thread_data = threads[next_thread_index++ % num_threads];
+                    std::shared_ptr<ThreadData> thread_data = threads[listener->next_thread_index++ % num_threads];
 
                     logger->logf(LOG_DEBUG, "Accepting connection on thread %d on %s", thread_data->threadnr, listener->getProtocolName().c_str());
 
@@ -736,8 +734,9 @@ void MainApp::start()
                     {
                         const std::string addr_s = sockaddrToString(addr);
                         bool do_close = false;
+                        const OverloadMode overload_mode = listener->overloadMode.value_or(settings.overloadMode);
 
-                        if (settings.overloadMode == OverloadMode::CloseNewClients)
+                        if (overload_mode == OverloadMode::CloseNewClients)
                         {
                             if (overloadLogCounter <= OVERLOAD_LOGS_MUTE_AFTER_LINES)
                             {
@@ -747,7 +746,7 @@ void MainApp::start()
                             }
                             do_close = true;
                         }
-                        else if (settings.overloadMode == OverloadMode::Log)
+                        else if (overload_mode == OverloadMode::Log)
                         {
                             if (overloadLogCounter <= OVERLOAD_LOGS_MUTE_AFTER_LINES)
                             {

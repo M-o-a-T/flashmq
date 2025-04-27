@@ -76,13 +76,13 @@ bool isValidPublishPath(const std::string &s)
 
 bool isValidSubscribePath(const std::string &s)
 {
-    bool plusAllowed = true;
+    bool wildcardAllowed = true;
     bool nextMustBeSlash = false;
     bool poundSeen = false;
 
     for (const char c : s)
     {
-        if (!plusAllowed && c == '+')
+        if (!wildcardAllowed && (c == '+' || c == '#'))
             return false;
 
         if (nextMustBeSlash && c != '/')
@@ -91,7 +91,7 @@ bool isValidSubscribePath(const std::string &s)
         if (poundSeen)
             return false;
 
-        plusAllowed = c == '/';
+        wildcardAllowed = c == '/';
         nextMustBeSlash = c == '+';
         poundSeen = c == '#';
     }
@@ -780,7 +780,7 @@ int maskAllSignalsCurrentThread()
     return r;
 }
 
-void parseSubscriptionShare(std::vector<std::string> &subtopics, std::string &shareName)
+void parseSubscriptionShare(std::vector<std::string> &subtopics, std::string &shareName, std::string &topic)
 {
     if (subtopics.size() < 3)
     {
@@ -809,6 +809,15 @@ void parseSubscriptionShare(std::vector<std::string> &subtopics, std::string &sh
 
     if (!(subtopics.size() > 1 || (subtopics.size() == 1 && !subtopics[0].empty()) ))
         throw ProtocolError("The / character after a shared subscription name MUST be followed by a topic filter.", ReasonCodes::ProtocolError);
+
+    topic.clear();
+
+    for(const std::string &s : subtopics)
+    {
+        if (!topic.empty())
+            topic.append("/");
+        topic.append(s);
+    }
 
     shareName = _shareName;
 }

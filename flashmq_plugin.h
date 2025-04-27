@@ -31,7 +31,7 @@
 #include <string_view>
 #include <optional>
 
-#define FLASHMQ_PLUGIN_VERSION 3
+#define FLASHMQ_PLUGIN_VERSION 4
 
 // Compatible with Mosquitto, for (auth) plugin compatability.
 #define LOG_NONE 0x00
@@ -48,6 +48,7 @@ extern "C"
 {
 
 class Client;
+class Session;
 
 /**
  * @brief The AclAccess enum's numbers are compatible with Mosquitto's 'int access'.
@@ -80,9 +81,10 @@ enum class AclAccess
  * with). MQTT5 subscribers with 'retain as published' will still see the retain flag set. This value is only valid for
  * AclAccess::write and requires a FlashMQ version 1.16.0 or higher.
  *
- * success_but_drop_publish = send success PUBACK back to client (if QoS) but don't process the publish. This may be useful in
- * combination with flashmq_publish_message() if you need to publish something new entirely (different topic or payload for
- * instance). This only works with AclAccess::write and requires FlashMQ 1.20.0 or higher.
+ * success_but_drop_publish / success_but_drop = send success SUBACK or PUBACK back to client (if QoS) but don't process the packet. This
+ * may be useful in combination with flashmq_publish_message() or flashmq_plugin_add_subscription() if you need to publish or subscribe
+ * something new entirely (different topic(s) or payload for instance). This only works with AclAccess::write (FlashMQ 1.20.0 or higher)
+ * and AclAccess::subscribe (FlashMQ 1.21.0 or higher).
  *
  * server_not_available = to be used as log-in result, for when you don't have auth data yet, for instance. MQTT3 and MQTT5 both support
  * sending 'ServerUnavailble' in their CONNACK, when this result is used. Requires FlashMQ 1.17.0 or newer.
@@ -99,6 +101,7 @@ enum class AuthResult
     success_without_retained_delivery = 51,
     success_without_setting_retained = 52,
     success_but_drop_publish = 53,
+    success_but_drop = 53,
     auth_continue = -4
 };
 
@@ -139,7 +142,7 @@ enum class ServerDisconnectReasons
 /**
  * @brief flashmq_plugin_remove_client queues a removal of a client in the proper thread, including session if required. It can be called by
  *        plugin code (meaning this function does not need to be implemented).
- * @param clientid
+ * @param session Can be obtained with flashmq_get_session_pointer().
  * @param alsoSession also remove the session if it would otherwise remain.
  * @param reasonCode is only for MQTT5, because MQTT3 doesn't have server-initiated disconnect packets.
  *
@@ -147,25 +150,41 @@ enum class ServerDisconnectReasons
  *
  * Can be called from any thread: the action will be queued properly.
  *
- * [Function provided by FlashMQ]
+ * [Function provided by FlashMQ; new version since plugin version 4]
  */
-void flashmq_plugin_remove_client(const std::string &clientid, bool alsoSession, ServerDisconnectReasons reasonCode);
+void flashmq_plugin_remove_client_v4(const std::weak_ptr<Session> &session, bool alsoSession, ServerDisconnectReasons reasonCode);
 
 /**
  * @brief flashmq_plugin_remove_subscription removes a client's subscription from the central store. It can be called by plugin code (meaning
  *        this function does not need to be implemented).
- * @param clientid
- * @param topicFilter
+ * @param session Can be obtained with flashmq_get_session_pointer().
+ * @param topicFilter Like 'one/two/three' or '$share/myshare/one/two/three'.
  *
  * It matches only literal filters. So removing '#' would only remove an active subscription on '#', not 'everything'.
  *
- * You need to keep track of subscriptions in 'flashmq_plugin_acl_check()' to be able to know what to remove.
+ * Will throw exceptions on certain errors.
+ *
+ * Can be called from any thread, because the global subscription store is mutexed.
+ *
+ * [Function provided by FlashMQ; new version since plugin version 4]
+ */
+void flashmq_plugin_remove_subscription_v4(const std::weak_ptr<Session> &session, const std::string &topicFilter);
+
+/**
+ * @brief flashmq_plugin_add_subscription
+ * @param session Can be obtained with flashmq_get_session_pointer().
+ * @param topicFilter Like 'one/two/three' or '$share/myshare/one/two/three'.
+ * @return boolean True when session found and subscription actually added.
+ *
+ * Will throw exceptions on certain errors.
  *
  * Can be called from any thread, because the global subscription store is mutexed.
  *
  * [Function provided by FlashMQ]
  */
-void flashmq_plugin_remove_subscription(const std::string &clientid, const std::string &topicFilter);
+bool flashmq_plugin_add_subscription(
+    const std::weak_ptr<Session> &session, const std::string &topicFilter, uint8_t qos, bool noLocal, bool retainAsPublished,
+    const uint32_t subscriptionIdentifier);
 
 /**
  * @brief flashmq_continue_async_authentication is to continue/finish async authentication.
@@ -219,6 +238,29 @@ public:
  * [Function provided by FlashMQ]
  */
 void flashmq_get_client_address(const std::weak_ptr<Client> &client, std::string *text, FlashMQSockAddr *addr);
+
+/**
+ * @brief flashmq_get_session_pointer Get reference counted weak pointer of a session.
+ * @param clientid The client ID of the session you're retrieving.
+ * @param username The username is used for verification, as a security measure.
+ * @param sessionOut The result (has to be an output parameter because we can't return it).
+ *
+ * The weak pointer will acurately reflect the original session. If it has been replaced with a new one with
+ * the same client ID, this weak pointer will be 'expired'.
+ *
+ * [Function provided by FlashMQ]
+ */
+void flashmq_get_session_pointer(const std::string &clientid, const std::string &username, std::weak_ptr<Session> &sessionOut);
+
+/**
+ * @brief flashmq_get_client_pointer Get reference counted client pointer of a session.
+ * @param clientOut The result (has to be an output parameter because we can't return it).
+ *
+ * Can we used to feed to other functions, or to check if the client is still online.
+ *
+ * [Function provided by FlashMQ]
+ */
+void flashmq_get_client_pointer(const std::weak_ptr<Session> &session, std::weak_ptr<Client> &clientOut);
 
 /**
  * @brief Allows async operation of outgoing connections you may need to make. It adds the file descriptor to
@@ -464,8 +506,20 @@ AuthResult flashmq_plugin_login_check(void *thread_data, const std::string &clie
 void flashmq_plugin_client_disconnected(void *thread_data, const std::string &clientid);
 
 /**
+ * @brief flashmq_plugin_on_unsubscribe is called after unsubscribe. Unsubscribe actions can't be manipulated or blocked.
+ * @param topic Does not contain the share name.
+ * @param subtopics Does not contain the share name.
+ *
+ * [Can optionally be implemented by plugin]
+ */
+void flashmq_plugin_on_unsubscribe(void *thread_data, const std::weak_ptr<Session> &session, const std::string &clientid,
+                                   const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
+                                   const std::string &shareName, const std::vector<std::pair<std::string, std::string>> *userProperties);
+
+/**
  * @brief flashmq_plugin_acl_check is called on publish, deliver and subscribe.
  * @param thread_data is memory allocated in flashmq_plugin_allocate_thread_memory().
+ * @param shareName The shared subscription name in a filter like '$share/my_share_name/one/two'. Is only present on AclAccess::subscribe.
  * @return
  *
  * You could throw exceptions here, but that will be slow and pointless. It will just get converted into AuthResult::error,
@@ -483,14 +537,14 @@ void flashmq_plugin_client_disconnected(void *thread_data, const std::string &cl
  * thread-safe. It will negate much of FlashMQ's multi-core model.
  *
  * When the 'access' is 'subscribe' and it's a shared subscription (like '$share/myshare/one/two/three'), you only get
- * the effective topic filter (like 'one/two/three').
+ * the effective topic filter (like 'one/two/three'). However, since plugin version 4, there is the argument 'shareName' for that.
  *
  * [Must be implemented by plugin]
  */
 AuthResult flashmq_plugin_acl_check(void *thread_data, const AclAccess access, const std::string &clientid, const std::string &username,
-                                    const std::string &topic, const std::vector<std::string> &subtopics, std::string_view payload,
-                                    const uint8_t qos, const bool retain, const std::optional<std::string> &correlationData,
-                                    const std::optional<std::string> &responseTopic,
+                                    const std::string &topic, const std::vector<std::string> &subtopics, const std::string &shareName,
+                                    std::string_view payload, const uint8_t qos, const bool retain,
+                                    const std::optional<std::string> &correlationData, const std::optional<std::string> &responseTopic,
                                     const std::vector<std::pair<std::string, std::string>> *userProperties);
 
 /**

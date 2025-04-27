@@ -1261,6 +1261,9 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
     if (!session)
         return;
 
+    if (protocolVersion >= ProtocolVersion::Mqtt311 && !data.sessionPresent)
+        session->resetQoSData();
+
     const uint16_t keepalive = data.keep_alive ? data.keep_alive : bridgeState->c.keepalive;
 
     const uint16_t effectiveMaxOutgoingTopicAliases = std::min<uint16_t>(data.max_outgoing_topic_aliases, bridgeState->c.maxOutgoingTopicAliases);
@@ -1295,8 +1298,11 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
         logger->log(LOG_DEBUG) << "Bridge '" << sender->repr() << "' subscribing locally to '" << pub.topic << "', QoS="
                                << static_cast<int>(pub.qos) << ".";
 
-        const std::vector<std::string> subtopics = splitTopic(pub.topic);
-        store->addSubscription(sender, subtopics, pub.qos, true, true, 0);
+        std::vector<std::string> subtopics = splitTopic(pub.topic);
+        std::string shareName;
+        std::string _;
+        parseSubscriptionShare(subtopics, shareName, _);
+        store->addSubscription(session, subtopics, pub.qos, true, true, shareName, 0);
     }
 
     ThreadGlobals::getThreadData()->publishBridgeState(bridgeState, true, {});
@@ -1623,7 +1629,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
             throw ProtocolError("QoS is greater than 2, and/or reserved bytes in QoS field are not 0.", ReasonCodes::MalformedPacket);
 
         std::string shareName;
-        parseSubscriptionShare(subtopics, shareName);
+        parseSubscriptionShare(subtopics, shareName, topic);
 
         if (!shareName.empty() && noLocal)
         {
@@ -1656,7 +1662,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
         if (authResult == AuthResult::success || authResult == AuthResult::success_without_retained_delivery)
         {
             const AuthResult newAuthResult = authentication.aclCheck(
-                sender->getClientId(), sender->getUsername(), topic, subtopics, std::string_view(), AclAccess::subscribe, qos,
+                sender->getClientId(), sender->getUsername(), topic, subtopics, shareName, std::string_view(), AclAccess::subscribe, qos,
                 false, std::optional<std::string>(), std::optional<std::string>(), getUserProperties());
 
             // We don't allow upgrading back to success. This gets too complicated between having no additional ACL, having an ACL file, and/or a plugin.
@@ -1664,7 +1670,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
                 authResult = newAuthResult;
         }
 
-        if (authResult == AuthResult::success || authResult == AuthResult::success_without_retained_delivery)
+        if (authResult == AuthResult::success || authResult == AuthResult::success_without_retained_delivery || authResult == AuthResult::success_but_drop)
         {
             const uint32_t subscr_id = settings->subscriptionIdentifierEnabled ? subscription_identifier : 0;
             deferredSubscribes.emplace_front(topic, subtopics, qos, noLocal, retainedAsPublished, shareName, authResult, subscr_id, retainHandling);
@@ -1690,21 +1696,26 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
     MqttPacket response(subAck);
     sender->writeMqttPacket(response);
 
+    std::shared_ptr<Session> session = sender->getSession();
+
     // Adding the subscription will also send publishes for retained messages, so that's why we're doing it at the end.
     for(const SubscriptionTuple &tup : deferredSubscribes)
     {
+        if (tup.authResult == AuthResult::success_but_drop)
+            continue;
+
         auto store = MainApp::getMainApp()->getSubscriptionStore();
 
         logger->log(LOG_SUBSCRIBE) << "Client '" << sender->repr() << "' subscribed to '" << tup.topic << "' QoS " << static_cast<int>(tup.qos);
         const AddSubscriptionType add_type = store->addSubscription(
-            sender, tup.subtopics, tup.qos, tup.noLocal, tup.retainAsPublished, tup.shareName, tup.subscriptionIdentifier);
+            session, tup.subtopics, tup.qos, tup.noLocal, tup.retainAsPublished, tup.shareName, tup.subscriptionIdentifier);
 
         if (tup.authResult == AuthResult::success && tup.shareName.empty())
         {
             if ((tup.retainHandling == RetainHandling::SendRetainedMessagesAtSubscribe) ||
                 (tup.retainHandling == RetainHandling::SendRetainedMessagesAtNewSubscribeOnly && add_type == AddSubscriptionType::NewSubscription) )
             {
-                store->giveClientRetainedMessages(sender->getSession(), tup.subtopics, tup.qos, tup.subscriptionIdentifier);
+                store->giveClientRetainedMessages(session, tup.subtopics, tup.qos, tup.subscriptionIdentifier);
             }
         }
     }
@@ -1776,17 +1787,30 @@ void MqttPacket::handleUnsubscribe(std::shared_ptr<Client> &sender)
     }
 
     int numberOfUnsubs = 0;
+    std::shared_ptr<Session> session = sender->getSession();
 
     while (remainingAfterPos() > 0)
     {
         numberOfUnsubs++;
 
-        std::string topic = readBytesToString();
+        const std::string topic = readBytesToString();
 
         if (topic.empty())
-            throw ProtocolError("Subscribe topic is empty.", ReasonCodes::MalformedPacket);
+            throw ProtocolError("Unsubscribe topic is empty.", ReasonCodes::MalformedPacket);
 
-        MainApp::getMainApp()->getSubscriptionStore()->removeSubscription(sender, topic);
+        if (!isValidSubscribePath(topic))
+            throw ProtocolError("Unsubscribe topic is invalid: " + topic, ReasonCodes::MalformedPacket);
+
+        std::vector<std::string> subtopics = splitTopic(topic);
+        std::string shareName;
+        std::string topic_without_sharename = topic;
+        parseSubscriptionShare(subtopics, shareName, topic_without_sharename);
+
+        MainApp::getMainApp()->getSubscriptionStore()->removeSubscription(session, subtopics, shareName);
+
+        const Authentication *auth = ThreadGlobals::getAuth();
+        auth->onUnsubscribe(session, sender->getClientId(), sender->getUsername(), topic_without_sharename, subtopics, shareName, getUserProperties());
+
         logger->logf(LOG_UNSUBSCRIBE, "Client '%s' unsubscribed from '%s'", sender->repr().c_str(), topic.c_str());
     }
 
@@ -2075,13 +2099,6 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
                 first_byte = bites[0];
 
                 PublishCopyFactory factory(this);
-
-                if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::SenderHash)
-                {
-                    const size_t senderHash = std::hash<std::string>()(sender->getClientId());
-                    factory.setSharedSubscriptionHashKey(senderHash);
-                }
-
                 ackSender.sendNow();
                 MainApp::getMainApp()->getSubscriptionStore()->queuePacketAtSubscribers(factory, sender->getClientId());
             }

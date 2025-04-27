@@ -133,7 +133,7 @@ PacketDropReason Session::writePacket(PublishCopyFactory &copyFactory, const uin
     assert(auth);
 
     const AuthResult aclResult = auth->aclCheck(
-        client_id, username, copyFactory.getTopic(), copyFactory.getSubtopics(), copyFactory.getPayload(), AclAccess::read,
+        client_id, username, copyFactory.getTopic(), copyFactory.getSubtopics(), "", copyFactory.getPayload(), AclAccess::read,
         effectiveQos, effectiveRetain, copyFactory.getCorrelationData(), copyFactory.getResponseTopic(), copyFactory.getUserProperties());
 
     if (aclResult != AuthResult::success)
@@ -422,6 +422,14 @@ uint16_t Session::getNextPacketIdLocked()
     return qos_locked->getNextPacketId();
 }
 
+void Session::resetQoSData()
+{
+    MutexLocked<QoSData> qos_locked = qos.lock();
+    QoSData &q = *qos_locked;
+    QoSData new_q(ThreadGlobals::getSettings()->maxQosMsgPendingPerClient);
+    q = std::move(new_q);
+}
+
 /**
  * @brief Session::getDestroyOnDisconnect
  * @return
@@ -484,11 +492,19 @@ uint32_t Session::getCurrentSessionExpiryInterval()
 
 void Session::setLocalPrefix(const std::optional<std::string> &s)
 {
+    // A work-around for prefixes of session being accessed cross-thread. The std::optional sets the 'engaged' flag last, so this works.
+    if (this->local_prefix)
+        return;
+
     this->local_prefix = s;
 }
 
 void Session::setRemotePrefix(const std::optional<std::string> &s)
 {
+    // A work-around for prefixes of session being accessed cross-thread. The std::optional sets the 'engaged' flag last, so this works.
+    if (this->remote_prefix)
+        return;
+
     this->remote_prefix = s;
 }
 

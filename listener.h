@@ -13,6 +13,7 @@ See LICENSE for license details.
 
 #include <string>
 #include <memory>
+#include <optional>
 
 #include "sslctxmanager.h"
 #include "enums.h"
@@ -26,6 +27,12 @@ enum class ListenerProtocol
 
 struct Listener
 {
+    /*
+     * We track this per listener so that if you isolate clients to a specific listener, you have
+     * control over on which thread it ends up.
+     */
+    size_t next_thread_index = 0;
+
     ListenerProtocol protocol = ListenerProtocol::IPv46;
     std::string inet4BindAddress;
     std::string inet6BindAddress;
@@ -41,6 +48,7 @@ struct Listener
     std::unique_ptr<SslCtxManager> sslctx;
     AllowListenerAnonymous allowAnonymous = AllowListenerAnonymous::None;
     TLSVersion minimumTlsVersion = TLSVersion::TLSv1_1;
+    std::optional<OverloadMode> overloadMode;
 
     void isValid();
     bool isSsl() const;

@@ -62,12 +62,22 @@ class Session
 
     friend class SessionsAndSubscriptionsDB;
 
+    /*
+     * THREADING WARNING
+     *
+     * Sessions are accessed cross-thread. Use unprotected primitives, atomics, MutexOwned objects, or
+     * const-constructed objects with careful consideration.
+     */
+
     LockedWeakPtr<Client> client;
     const std::string client_id;
     const std::string username;
     MutexOwned<QoSData> qos;
+
+    // Note, we set these write-once to avoid threading issues. As a work-around to avoid mutexing in a hot path.
     std::optional<std::string> local_prefix;
     std::optional<std::string> remote_prefix;
+
     std::mutex clientSwitchMutex;
 
     uint32_t sessionExpiryInterval = 0;
@@ -108,6 +118,7 @@ public:
     void removeOutgoingQoS2MessageId(u_int16_t packet_id);
     void increaseFlowControlQuotaLocked();
     uint16_t getNextPacketIdLocked();
+    void resetQoSData();
 
     bool getDestroyOnDisconnect() const;
 

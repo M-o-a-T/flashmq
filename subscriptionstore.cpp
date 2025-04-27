@@ -256,52 +256,31 @@ std::shared_ptr<SubscriptionNode> SubscriptionStore::getDeepestNode(const std::v
 }
 
 AddSubscriptionType SubscriptionStore::addSubscription(
-    std::shared_ptr<Client> &client, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
-    uint32_t subscriptionIdentifier)
-{
-    const static std::string empty;
-    return addSubscription(client, subtopics, qos, noLocal, retainAsPublished, empty, subscriptionIdentifier);
-}
-
-AddSubscriptionType SubscriptionStore::addSubscription(
-    std::shared_ptr<Client> &client, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
+    const std::shared_ptr<Session> &session, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
     const std::string &shareName, const uint32_t subscriptionIdentifier)
 {
+    if (!session) return AddSubscriptionType::Invalid;
+
     const std::shared_ptr<SubscriptionNode> deepestNode = getDeepestNode(subtopics);
 
     if (!deepestNode)
         return AddSubscriptionType::Invalid;
 
-    return deepestNode->addSubscriber(client->getSession(), qos, noLocal, retainAsPublished, shareName, subscriptionIdentifier);
+    return deepestNode->addSubscriber(session, qos, noLocal, retainAsPublished, shareName, subscriptionIdentifier);
 }
 
-void SubscriptionStore::removeSubscription(std::shared_ptr<Client> &client, const std::string &topic)
+void SubscriptionStore::removeSubscription(
+    const std::shared_ptr<Session> &session, const std::vector<std::string> &subtopics, const std::string &shareName)
 {
-    std::vector<std::string> subtopics = splitTopic(topic);
-
-    std::string shareName;
-    parseSubscriptionShare(subtopics, shareName);
+    if (!session)
+        return;
 
     std::shared_ptr<SubscriptionNode> node = getDeepestNode(subtopics, true);
 
     if (!node)
         return;
 
-    std::shared_ptr<Session> ses;
-
-    {
-        std::shared_lock session_locker(sessions_lock);
-        auto session_it = sessionsByIdConst.find(client->getClientId());
-        if (session_it != sessionsByIdConst.end())
-        {
-            ses = session_it->second;
-        }
-    }
-
-    if (!ses)
-        return;
-
-    node->removeSubscriber(ses, shareName);
+    node->removeSubscriber(session, shareName);
 }
 
 std::shared_ptr<Session> SubscriptionStore::getBridgeSession(std::shared_ptr<Client> &client)
@@ -310,10 +289,14 @@ std::shared_ptr<Session> SubscriptionStore::getBridgeSession(std::shared_ptr<Cli
 
     std::unique_lock locker(sessions_lock);
 
-    std::shared_ptr<Session> session = std::make_shared<Session>(client_id, client->getUsername());
+    std::shared_ptr<Session> &session = sessionsById[client_id];
+
+    if (!session)
+        session = std::make_shared<Session>(client_id, client->getUsername());
+
     session->assignActiveConnection(client);
     client->assignSession(session);
-    sessionsById[client_id] = session;
+    session->setClientType(ClientType::LocalBridge);
     return session;
 }
 
@@ -517,8 +500,7 @@ void SubscriptionStore::queueWillMessage(const std::shared_ptr<WillPublish> &wil
 }
 
 void SubscriptionStore::publishNonRecursively(
-    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, size_t distributionHash,
-    const std::string &senderClientId) noexcept
+    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, const std::string &senderClientId) noexcept
 {
     std::shared_lock locker(this_node->lock);
 
@@ -558,7 +540,10 @@ void SubscriptionStore::publishNonRecursively(
         const Subscription *sub = nullptr;
 
         if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::SenderHash)
-            sub = subscribers.getNext(distributionHash);
+        {
+            const size_t hash = std::hash<std::string>()(senderClientId);
+            sub = subscribers.getNext(hash);
+        }
         else if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::RoundRobin)
             sub = subscribers.getNext();
         else if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::First)
@@ -596,19 +581,19 @@ void SubscriptionStore::publishNonRecursively(
  */
 void SubscriptionStore::publishRecursively(
     std::vector<std::string>::const_iterator cur_subtopic_it, std::vector<std::string>::const_iterator end,
-    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, size_t distributionHash,
+    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions,
     const std::string &senderClientId) noexcept
 {
     if (cur_subtopic_it == end) // This is the end of the topic path, so look for subscribers here.
     {
         if (this_node)
         {
-            publishNonRecursively(this_node, targetSessions, distributionHash, senderClientId);
+            publishNonRecursively(this_node, targetSessions, senderClientId);
 
             // Subscribing to 'one/two/three/#' also gives you 'one/two/three'.
             if (this_node->childrenPound)
             {
-                publishNonRecursively(this_node->childrenPound.get(), targetSessions, distributionHash, senderClientId);
+                publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId);
             }
         }
         return;
@@ -627,19 +612,19 @@ void SubscriptionStore::publishRecursively(
 
     if (this_node->childrenPound)
     {
-        publishNonRecursively(this_node->childrenPound.get(), targetSessions, distributionHash, senderClientId);
+        publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId);
     }
 
     const auto &sub_node = this_node->children.find(cur_subtop);
 
     if (this_node->childrenPlus)
     {
-        publishRecursively(next_subtopic, end, this_node->childrenPlus.get(), targetSessions, distributionHash, senderClientId);
+        publishRecursively(next_subtopic, end, this_node->childrenPlus.get(), targetSessions, senderClientId);
     }
 
     if (sub_node != this_node->children.end())
     {
-        publishRecursively(next_subtopic, end, sub_node->second.get(), targetSessions, distributionHash, senderClientId);
+        publishRecursively(next_subtopic, end, sub_node->second.get(), targetSessions, senderClientId);
     }
 }
 
@@ -664,7 +649,7 @@ void SubscriptionStore::queuePacketAtSubscribers(PublishCopyFactory &copyFactory
     {
         const std::vector<std::string> &subtopics = copyFactory.getSubtopics();
         std::shared_lock locker(subscriptions_lock);
-        publishRecursively(subtopics.begin(), subtopics.end(), startNode, subscriberSessions, copyFactory.getSharedSubscriptionHashKey(), senderClientId);
+        publishRecursively(subtopics.begin(), subtopics.end(), startNode, subscriberSessions, senderClientId);
     }
 
     if (subscriberSessions.size() > reserve && subscriberSessions.size() <= 1048576)

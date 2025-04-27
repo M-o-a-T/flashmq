@@ -164,11 +164,10 @@ class SubscriptionStore
     Logger *logger = Logger::getInstance();
 
     static void publishNonRecursively(
-        SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, size_t distributionHash,
-        const std::string &senderClientId) noexcept;
+        SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, const std::string &senderClientId) noexcept;
     static void publishRecursively(
         std::vector<std::string>::const_iterator cur_subtopic_it, std::vector<std::string>::const_iterator end,
-        SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, size_t distributionHash, const std::string &senderClientId) noexcept;
+        SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, const std::string &senderClientId) noexcept;
     static void giveClientRetainedMessagesRecursively(std::vector<std::string>::const_iterator cur_subtopic_it,
                                                       std::vector<std::string>::const_iterator end, const std::shared_ptr<RetainedMessageNode> &this_node, bool poundMode,
                                                       const std::shared_ptr<Session> &session, const uint8_t max_qos,
@@ -197,12 +196,9 @@ public:
     SubscriptionStore();
 
     AddSubscriptionType addSubscription(
-        std::shared_ptr<Client> &client, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
-        uint32_t subscriptionIdentifier);
-    AddSubscriptionType addSubscription(
-        std::shared_ptr<Client> &client, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
+        const std::shared_ptr<Session> &session, const std::vector<std::string> &subtopics, uint8_t qos, bool noLocal, bool retainAsPublished,
         const std::string &shareName, const uint32_t subscriptionIdentifier);
-    void removeSubscription(std::shared_ptr<Client> &client, const std::string &topic);
+    void removeSubscription(const std::shared_ptr<Session> &session, const std::vector<std::string> &subtopics, const std::string &shareName);
     std::shared_ptr<Session> getBridgeSession(std::shared_ptr<Client> &client);
     void registerClientAndKickExistingOne(std::shared_ptr<Client> &client);
     void registerClientAndKickExistingOne(std::shared_ptr<Client> &client, bool clean_start, uint16_t clientReceiveMax, uint32_t sessionExpiryInterval);
