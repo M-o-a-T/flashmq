@@ -41,6 +41,5 @@ install(TARGETS flashmq
 install(DIRECTORY DESTINATION "/var/lib/flashmq")
 install(DIRECTORY DESTINATION "/var/log/flashmq")
 install(FILES flashmq.conf DESTINATION "/etc/flashmq")
-install(FILES debian/flashmq.service DESTINATION "/lib/systemd/system")
 install(FILES man/flashmq.conf.5 DESTINATION "/usr/share/man/man5")
 install(FILES man/flashmq.1 DESTINATION "/usr/share/man/man1")

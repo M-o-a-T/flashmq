@@ -1,3 +1,9 @@
+flashmq (1.21.1-2) unstable; urgency=medium
+
+  * Fix systemd unit installation
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 12 May 2025 05:32:24 +0200
+
 flashmq (1.21.1-1) unstable; urgency=medium
 
   * Upstream merge.
