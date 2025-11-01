@@ -222,6 +222,9 @@ multi-value-param one 'two' "three" "with ' char"
             The client's write buffer is where packets are stored before the event loop has the chance to flush them out. Any time a client's connection is bad and bytes can't be flushed, this buffer fills. So, there's good reason to limit this to something sensible. A good indication is your average packet size (or better yet, a configured <option>max_packet_size</option>) multiplied by the amount of packets you want to be able to buffer.
           </para>
           <para>
+            Despite the name, this settings also control the read buffer's maximum size. Having a bigger read buffer may be necessary when you know your clients receive many packets.
+          </para>
+          <para>
             Note that it's an approximate value and not a hard limit. Buffer sizes only grow by powers of two, and buffers are always allowed to grow to make place for ping packets. Additionally, upon arrival of large packets (up to <option>max_packet_size</option> bytes), room will be made up to twice their size. So, you may also want to reduce <option>max_packet_size</option> from the default.
           </para>
           <para>
@@ -381,6 +384,40 @@ multi-value-param one 'two' "three" "with ' char"
               <para>max_qos_bytes_pending_per_client 65536</para>
             </listitem>
           </itemizedlist>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="max_qos" condition="flashmq ≥ 1.23.0">
+        <term><option>max_qos</option> <replaceable>qos_value</replaceable></term>
+        <listitem>
+          <para>
+            The maximum QoS value FlashMQ will allow clients to use for subscriptions, publishes and wills. Subscriptions will be downgraded to this value. Publishes and wills will cause a disconnect for MQTT5 clients, and the action configured with <link xlink:href="#mqtt3_qos_exceed_action"><option>mqtt3_qos_exceed_action</option></link> for MQTT3 clients.
+          </para>
+          <para>
+            The value is updated on config reload, but only for new clients. The reason is that the max QoS is part of the handshake in MQTT5, and clients will be surprised (and cause disconnects) if that changes during the lifetime of a connection. For consistency, the MQTT3 clients behave the same.
+          </para>
+          <para>
+            This setting is also available per listener.
+          </para>
+          <para>
+            Default value: <literal>2</literal>
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="mqtt3_qos_exceed_action" condition="flashmq ≥ 1.23.0">
+        <term><option>mqtt3_qos_exceed_action</option> <replaceable>drop|disconnect</replaceable></term>
+        <listitem>
+          <para>
+            Unlike MQTT5, MQTT3 doesn't have defined behavior for exceeding a configured maximum QoS (see <link xlink:href="#max_qos"><option>max_qos</option></link> ). This allows the behavior to be controlled.
+          </para>
+          <para>
+            In case of <literal>drop</literal> the client gets an acknowledgement as if the publish has succeeded, to avoid stale in-flight packets.
+          </para>
+          <para>
+            This setting is also available per listener.
+          </para>
+          <para>
+            Default value: <literal>disconnect</literal>
+          </para>
         </listitem>
       </varlistentry>
       <varlistentry xml:id="max_incoming_topic_alias_value" condition="flashmq ≥ 1.4.2">
@@ -738,16 +775,22 @@ multi-value-param one 'two' "three" "with ' char"
         </listitem>
       </varlistentry>
       <varlistentry xml:id="protocol">
-        <term><option>protocol</option> <replaceable>mqtt</replaceable>|<replaceable>websockets</replaceable></term>
+        <term><option>protocol</option> <replaceable>mqtt</replaceable>|<replaceable>websockets</replaceable>|<replaceable>acme</replaceable></term>
         <listitem>
           <para>
             This is a required parameter.
           </para>
+          <para>
+              For <literal>acme</literal>, see <link xlink:href="#listen__acme_redirect_url">acme_redirect_url</link>.
+          </para>
         </listitem>
       </varlistentry>
       <varlistentry xml:id="inet_protocol">
-        <term><option>inet_protocol</option> <replaceable>ip4_ip6</replaceable>|<replaceable>ip4</replaceable>|<replaceable>ip6</replaceable></term>
+        <term><option>inet_protocol</option> <replaceable>ip4_ip6</replaceable>|<replaceable>ip4</replaceable>|<replaceable>ip6</replaceable>|<replaceable>unix</replaceable></term>
         <listitem>
+          <para>
+              When using <literal>unix</literal>, a <option>unix_socket_path</option> is required.
+          </para>
           <para>
             Default: <literal>ip4_ip6</literal>
           </para>
@@ -766,6 +809,47 @@ multi-value-param one 'two' "three" "with ' char"
         <listitem>
           <para>
             Default: ::0
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="unix_socket_path" condition="flashmq ≥ 1.22.0">
+        <term><option>unix_socket_path</option> <replaceable>path</replaceable></term>
+        <listitem>
+          <para>
+            When using <literal>unix</literal> for <option>inet_protocol</option>, the file path of the socket.
+          </para>
+          <para>
+            FlashMQ will remove pre-existing socket files if they already exist.
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="unix_socket_user" condition="flashmq ≥ 1.23.0">
+        <term><option>unix_socket_user</option> <replaceable>user</replaceable></term>
+        <listitem>
+          <para>
+            Use this to set the owner of the socket. It will always be attempted to set it, but a warning may be logged if not successful. Users may be specified as numeric or names.
+          </para>
+          <para>
+            A config test will not verify the existence of users, for portability.
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="unix_socket_group" condition="flashmq ≥ 1.23.0">
+        <term><option>unix_socket_group</option> <replaceable>group</replaceable></term>
+        <listitem>
+          <para>
+            Use this to set the group of the socket. It will always be attempted to set it, but a warning may be logged if not successful. Groups may be specified as numeric or names.
+          </para>
+          <para>
+            A config test will not verify the existence of groups, for portability.
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="unix_socket_mode" condition="flashmq ≥ 1.23.0">
+        <term><option>unix_socket_mode</option> <replaceable>mode</replaceable></term>
+        <listitem>
+          <para>
+              Use this to specify the permission mode of the unix socket, like <literal>600</literal>.
           </para>
         </listitem>
       </varlistentry>
@@ -837,6 +921,51 @@ multi-value-param one 'two' "three" "with ' char"
         </listitem>
       </varlistentry>
 
+      <varlistentry xml:id="listen__acme_redirect_url" condition="flashmq ≥ 1.22.0">
+        <term><option>acme_redirect_url</option> <replaceable>http://example.com/</replaceable></term>
+        <listitem>
+          <para>
+            This allows an ACME (automated certificate management environment) challenge to be redirected elsewhere. This allows decoupling of the certificate creation from the host(s) that run FlashMQ.
+          </para>
+          <para>
+            This can either be configured on a dedicated listener with <option>protocol</option> <literal>acme</literal>, or multiplexed on a non-SSL <literal>mqtt</literal> or <literal>websockets</literal> listener.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="listen__drop_on_absent_certificate" condition="flashmq ≥ 1.22.0">
+        <term><option>drop_on_absent_certificate</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
+        <listitem>
+          <para>
+            When both <option>privkey</option> and <option>fullchain</option> are absent, don't create this listener. This can help in situations where you don't have the certificate and key yet, but you are expecting them.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="listen__only_allow_from" condition="flashmq ≥ 1.22.0">
+        <term><option>only_allow_from</option> <replaceable>inet4_address</replaceable>|<replaceable>inet6_address</replaceable></term>
+        <listitem>
+          <para>
+            When set, restricts the listener to the source address/network given.
+          </para>
+          <para>
+            You can repeat the option to allow multiple addresses/networks. Valid notations are <replaceable>1.2.3.4</replaceable>, <replaceable>1.2.3.4/16</replaceable>, <replaceable>1.2.0.0/16</replaceable>, <replaceable>2a01:1337::1</replaceable>, <replaceable>2a01:1337::1/64</replaceable>, etc.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="listen__deny_from" condition="flashmq ≥ 1.22.0">
+        <term><option>deny_from</option> <replaceable>inet4_address</replaceable>|<replaceable>inet6_address</replaceable></term>
+        <listitem>
+          <para>
+            Block connections from this address or network.
+          </para>
+          <para>
+            You can repeat the option multiple times. Valid notations are <replaceable>1.2.3.4</replaceable>, <replaceable>1.2.3.4/16</replaceable>, <replaceable>1.2.0.0/16</replaceable>, <replaceable>2a01:1337::1</replaceable>, <replaceable>2a01:1337::1/64</replaceable>, etc.
+          </para>
+        </listitem>
+      </varlistentry>
+
       <varlistentry xml:id="listen__allow_anonymous" condition="flashmq ≥ 1.10.0">
         <term><option>allow_anonymous</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
         <listitem>
@@ -890,6 +1019,34 @@ multi-value-param one 'two' "three" "with ' char"
           </para>
         </listitem>
       </varlistentry>
+
+      <varlistentry xml:id="listen__max_buffer_size" condition="flashmq ≥ 1.22.0">
+        <term><option>max_buffer_size</option> <replaceable>number</replaceable></term>
+        <listitem>
+          <para>
+            Override the <option>client_max_write_buffer_size</option> for this listener. This is especially useful when this listener is the receiving side of a bridge, because these clients will likely see more traffic.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="listen__max_qos" condition="flashmq ≥ 1.23.0">
+        <term><option>max_qos</option> <replaceable>qos_value</replaceable></term>
+        <listitem>
+          <para>
+              Per-listener counterpart of <link xlink:href="#max_qos"><option>max_qos</option></link>.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="listen__mqtt3_qos_exceed_action" condition="flashmq ≥ 1.23.0">
+        <term><option>mqtt3_qos_exceed_action</option> <replaceable>drop|disconnect</replaceable></term>
+        <listitem>
+          <para>
+              Per-listener counterpart of <link xlink:href="#mqtt3_qos_exceed_action"><option>mqtt3_qos_exceed_action</option></link>.
+          </para>
+        </listitem>
+      </varlistentry>
+
     </variablelist>
   </refsect1>
 
@@ -944,7 +1101,7 @@ listen {
   <refsect1 xml:id="bridge" condition="flashmq ≥ 1.7.0">
     <title>Bridge configuration</title>
     <para>
-       Bridges can be defined inside <literal>bridge { }</literal> blocks. A bridge is essentially just an outgoing connection to another server with loop-detection and retain flag relaying. It is not a form of clustering. Also note that one bridge is one connection, and because FlashMQ's threading model is that clients are serviced by one selected thread only, a bridge has the potential to saturate a thread, if it's heavily loaded. You could work around that by defining multiple bridges to the same server, for various topic paths. A future version of FlashMQ will likely improve upon this.
+      Bridges can be defined inside <literal>bridge { }</literal> blocks. A bridge is essentially just an outgoing connection to another server with loop-detection and retain flag relaying. It is not a form of clustering, although with careful design, it can be deployed to achieve some sort of load balancing. Note that normally (unless <option>connection_count</option> is set) one bridge is one connection, and because FlashMQ's threading model is that clients are serviced by one selected thread only, a bridge has the potential to saturate a thread, if it's heavily loaded. You can improve that with <option>connection_count</option>.
     </para>
 
     <para>
@@ -1166,7 +1323,7 @@ listen {
               In MQTT3 mode, this means 'clean session' and means the session is removed upon disconnect. If you want to reuse sessions on reconnect, set this to false. Any new start of FlashMQ will give you a new client ID so will always be a fresh session, except if you set <option>use_saved_clientid</option>.
           </para>
           <para>
-            In MQTT5 mode, this has no effect. If you want the session to be removed immediately on disconnect, use <option>local_session_expiry_interval</option> to 0.
+            In MQTT5 mode, this only has effect on start, where any existing local session is removed if found. If you want the session to be removed immediately on disconnect, use <option>local_session_expiry_interval</option> to 0.
           </para>
           <para>
             Also see <link xlink:href="https://www.flashmq.org/2022/11/26/understanding-clean-session-and-clean-start/">understanding clean session and clean start</link>.
@@ -1310,6 +1467,46 @@ listen {
           </para>
         </listitem>
       </varlistentry>
+
+      <varlistentry xml:id="bridge__connection_count" condition="flashmq ≥ 1.22.0">
+        <term><option>connection_count</option> <replaceable>number</replaceable>|<replaceable>auto</replaceable></term>
+        <listitem>
+          <para>
+            Normally a bridge has one TCP connection to the other side. This means that dealing with bridge traffic is limited to one thread, which also applies to the remote side if that is also FlashMQ. With this option, you can make a bridge have multiple connections, and share the traffic load over them using MQTT5 'shared subscriptions'.
+          </para>
+          <para>
+            When you specify a <option>publish</option> or <option>subscribe</option> path of <literal>one/two/three</literal>, the topic is adjusted to <literal>$share/RANDOM/one/two/three</literal> to create a shared subscription so that load is balanced. With FlashMQ, load balancing is especially important for the side processing publishes (because each received publish packet means subscribers have to be looked up, auth checked, etc).
+          </para>
+          <para>
+            The <option>shared_subscription_targeting</option> mode is automatically set to <literal>sender_hash</literal>. This is required to ensure sequential message relaying (to retain ordering), and it's also better in plugin code when messages from one source are kept to one thread, as it would be under normal circumstances.
+          </para>
+          <para>
+            If FlashMQ is also on the receiving end of these load balanced connections, it uses an extra feature to group clients of one bridge together to enhance loop detection. Normally MQTT5 supports the 'no-local' subscription option for that, but the standard states that is not allowed for shared subscriptions. FlashMQ uses 'user properties' to communicate the group they belong to, so that we can still do this kind of loop detection. This allows you to specify overlapping paths in the <option>subscribe</option> and <option>publish</option> options of a bridge. Note that both ends should use FlashMQ version 1.22.0 or higher.
+          </para>
+          <para>
+            When the target server indeed is also FlashMQ, it may be smart to create a dedicated listener, for several reasons. One is that incoming connections are given to threads in a sequential order per listener, this ensures the best spread over worker threads. It also allows you to set <option>overload_mode</option>, <option>max_buffer_size</option> and posssibly <option>only_allow_from</option> and <option>deny_from</option> differently for that listener.
+          </para>
+          <para>
+              You can specify an amount of connections, or <literal>auto</literal> for one connection per CPU. FlashMQs load is mostly on the receiver of messages, so <literal>auto</literal> will likely be a good choice if most of your message load from the other side is incoming, vs outgoing. Otherwise it's best matched to the other side's number of CPUs.
+          </para>
+          <para>
+            Default: <replaceable>1</replaceable>
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="bridge__max_buffer_size" condition="flashmq ≥ 1.22.0">
+        <term><option>max_buffer_size</option> <replaceable>number</replaceable></term>
+        <listitem>
+          <para>
+            Override the <option>client_max_write_buffer_size</option> for this bridge. When <option>connection_count</option> is used, this size applies to each connection individually.
+          </para>
+          <para>
+            Bridges typically have more traffic than single clients, in which case it makes sense to increase this.
+          </para>
+        </listitem>
+      </varlistentry>
+
 
     </variablelist>
   </refsect1>

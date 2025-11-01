@@ -20,6 +20,12 @@ See LICENSE for license details.
 #include <signal.h>
 #include <iomanip>
 #include <time.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <iostream>
+#include <signal.h>
+#include <pwd.h>
+#include <grp.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -185,6 +191,13 @@ void rtrim(std::string &s)
     }).base(), s.end());
 }
 
+void rtrim(std::string &s, char c)
+{
+    s.erase(std::find_if(s.rbegin(), s.rend(), [c](unsigned char ch) {
+        return c != ch;
+    }).base(), s.end());
+}
+
 void trim(std::string &s)
 {
     ltrim(s);
@@ -272,90 +285,6 @@ bool isPowerOfTwo(int n)
     return (n != 0) && (n & (n - 1)) == 0;
 }
 
-bool parseHttpHeader(CirBuf &buf, std::string &websocket_key, int &websocket_version, std::string &subprotocol, std::string &xRealIp)
-{
-    std::vector<char> buf_data = buf.peekAllToVector();
-
-    const std::string s(buf_data.data(), buf_data.size());
-    std::istringstream is(s);
-    bool doubleEmptyLine = false; // meaning, the HTTP header is complete
-    bool upgradeHeaderSeen = false;
-    bool connectionHeaderSeen = false;
-    bool firstLine = true;
-    bool subprotocol_seen = false;
-
-    std::string line;
-    while (std::getline(is, line))
-    {
-        trim(line);
-        if (firstLine)
-        {
-            firstLine = false;
-            if (!startsWith(line, "GET"))
-                throw BadHttpRequest("Websocket request should start with GET.");
-            continue;
-        }
-        if (line.empty())
-        {
-            doubleEmptyLine = true;
-            break;
-        }
-
-        std::list<std::string> fields = split(line, ':', 1);
-
-        if (fields.size() != 2)
-        {
-            throw BadHttpRequest("This does not look like a HTTP request.");
-        }
-
-        const std::vector<std::string> fields2(fields.begin(), fields.end());
-        std::string name = str_tolower(fields2[0]);
-        trim(name);
-        std::string value = fields2[1];
-        trim(value);
-        std::string value_lower = str_tolower(value);
-
-        if (name == "upgrade" && value_lower == "websocket")
-            upgradeHeaderSeen = true;
-        else if (name == "connection" && strContains(value_lower, "upgrade"))
-            connectionHeaderSeen = true;
-        else if (name == "sec-websocket-key")
-            websocket_key = value;
-        else if (name == "sec-websocket-version")
-            websocket_version = stoi(value);
-        else if (name == "sec-websocket-protocol" && strContains(value_lower, "mqtt"))
-        {
-            std::vector<std::string> protocols = splitToVector(value, ',');
-
-            for(std::string &prot : protocols)
-            {
-                trim(prot);
-
-                // Return what is requested, which can be 'mqttv3.1' or 'mqtt', or whatever variant.
-                if (strContains(str_tolower(prot), "mqtt"))
-                {
-                    subprotocol = prot;
-                    subprotocol_seen = true;
-                }
-            }
-        }
-        else if (name == "x-real-ip" && value.length() < 64)
-        {
-            xRealIp = value;
-        }
-    }
-
-    if (doubleEmptyLine)
-    {
-        if (!connectionHeaderSeen || !upgradeHeaderSeen)
-            throw BadHttpRequest("HTTP request is not a websocket upgrade request.");
-        if (!subprotocol_seen)
-            throw BadHttpRequest("HTTP header Sec-WebSocket-Protocol with value 'mqtt' must be present.");
-    }
-
-    return doubleEmptyLine;
-}
-
 std::vector<char> base64Decode(const std::string &s)
 {
     if (s.length() % 4 != 0)
@@ -392,58 +321,6 @@ std::string base64Encode(const unsigned char *input, const int length)
         throw std::runtime_error("Base64 encode error.");
 
     return result;
-}
-
-std::string generateWebsocketAcceptString(const std::string &websocketKey)
-{
-    unsigned char md_value[EVP_MAX_MD_SIZE];
-    unsigned int md_len;
-
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();;
-    const EVP_MD *md = EVP_sha1();
-    EVP_DigestInit_ex(mdctx, md, NULL);
-
-    const std::string keyPlusMagic = websocketKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-    EVP_DigestUpdate(mdctx, keyPlusMagic.c_str(), keyPlusMagic.length());
-    EVP_DigestFinal_ex(mdctx, md_value, &md_len);
-    EVP_MD_CTX_free(mdctx);
-
-    std::string base64 = base64Encode(md_value, md_len);
-    return base64;
-}
-
-std::string generateInvalidWebsocketVersionHttpHeaders(const int wantedVersion)
-{
-    std::ostringstream oss;
-    oss << "HTTP/1.1 400 Bad Request\r\n";
-    oss << "Sec-WebSocket-Version: " << wantedVersion;
-    oss << "\r\n";
-    oss.flush();
-    return oss.str();
-}
-
-std::string generateBadHttpRequestReponse(const std::string &msg)
-{
-    std::ostringstream oss;
-    oss << "HTTP/1.1 400 Bad Request\r\n";
-    oss << "\r\n";
-    oss << msg;
-    oss.flush();
-    return oss.str();
-}
-
-std::string generateWebsocketAnswer(const std::string &acceptString, const std::string &subprotocol)
-{
-    std::ostringstream oss;
-    oss << "HTTP/1.1 101 Switching Protocols\r\n";
-    oss << "Upgrade: websocket\r\n";
-    oss << "Connection: Upgrade\r\n";
-    oss << "Sec-WebSocket-Accept: " << acceptString << "\r\n";
-    oss << "Sec-WebSocket-Protocol: " << subprotocol << "\r\n";
-    oss << "\r\n";
-    oss.flush();
-    return oss.str();
 }
 
 // Using a separate ssl context to test, because it's the easiest way to load certs and key atomitcally.
@@ -511,8 +388,11 @@ std::string formatString(const std::string str, ...)
 
     va_list valist;
     va_start(valist, str);
-    vsnprintf(buf, bufsize, str.c_str(), valist);
+    int rc = vsnprintf(buf, bufsize, str.c_str(), valist);
     va_end(valist);
+
+    if (rc < 0)
+        return std::string();
 
     size_t len = std::min<size_t>(strlen(buf), bufsize);
     std::string result(buf, len);
@@ -524,45 +404,6 @@ std::string_view dirnameOf(std::string_view path)
 {
     size_t pos = path.find_last_of("\\/");
     return (std::string::npos == pos) ? "" : path.substr(0, pos);
-}
-
-
-BindAddr getBindAddr(int family, const std::string &bindAddress,  int port)
-{
-    BindAddr result;
-
-    if (family == AF_INET)
-    {
-        struct sockaddr_in *in_addr_v4 = new sockaddr_in();
-        result.len = sizeof(struct sockaddr_in);
-        memset(in_addr_v4, 0, result.len);
-
-        if (bindAddress.empty())
-            in_addr_v4->sin_addr.s_addr = INADDR_ANY;
-        else
-            inet_pton(AF_INET, bindAddress.c_str(), &in_addr_v4->sin_addr);
-
-        in_addr_v4->sin_family = AF_INET;
-        in_addr_v4->sin_port = htons(port);
-        result.p.reset(reinterpret_cast<sockaddr*>(in_addr_v4));
-    }
-    if (family == AF_INET6)
-    {
-        struct sockaddr_in6 *in_addr_v6 = new sockaddr_in6();
-        result.len = sizeof(struct sockaddr_in6);
-        memset(in_addr_v6, 0, result.len);
-
-        if (bindAddress.empty())
-            in_addr_v6->sin6_addr = IN6ADDR_ANY_INIT;
-        else
-            inet_pton(AF_INET6, bindAddress.c_str(), &in_addr_v6->sin6_addr);
-
-        in_addr_v6->sin6_family = AF_INET6;
-        in_addr_v6->sin6_port = htons(port);
-        result.p.reset(reinterpret_cast<sockaddr*>(in_addr_v6));
-    }
-
-    return result;
 }
 
 size_t getFileSize(const std::string &path)
@@ -578,7 +419,7 @@ size_t getFileSize(const std::string &path)
     return statbuf.st_size;
 }
 
-size_t getFreeSpace(const std::string &path)
+uint64_t getFreeSpace(const std::string &path)
 {
     struct statvfs statbuf;
     memset(&statbuf, 0, sizeof(struct statvfs));
@@ -586,8 +427,25 @@ size_t getFreeSpace(const std::string &path)
     if (statvfs(path.c_str(), &statbuf) < 0)
         throw std::runtime_error("Can't get free space of " + path);
 
-    const size_t result {statbuf.f_bsize * statbuf.f_bfree};
+    const uint64_t result {statbuf.f_bsize * statbuf.f_bfree};
     return result;
+}
+
+/**
+ * @brief Get socket family from addr that works with strict type aliasing.
+ *
+ * Disgruntled: if type aliasing rules are so strict, why is there no library
+ * function to obtain the family from a sockaddr...?
+ */
+sa_family_t getFamilyFromSockAddr(const sockaddr *addr)
+{
+    if (!addr)
+        return AF_UNSPEC;
+
+    sockaddr tmp;
+    std::memcpy(&tmp, addr, sizeof(tmp));
+
+    return tmp.sa_family;
 }
 
 std::string sockaddrToString(const sockaddr *addr)
@@ -595,43 +453,34 @@ std::string sockaddrToString(const sockaddr *addr)
     if (!addr)
         return "[unknown address]";
 
-    char buf[INET6_ADDRSTRLEN];
-    const void *addr_in = nullptr;
+    std::array<char, INET6_ADDRSTRLEN> buf;
+    std::fill(buf.begin(), buf.end(), 0);
 
-    if (addr->sa_family == AF_INET)
+    const int family = getFamilyFromSockAddr(addr);
+    const char *rc = nullptr;
+
+    if (family == AF_INET)
     {
-        const struct sockaddr_in *ipv4sockAddr = reinterpret_cast<const struct sockaddr_in*>(addr);
-        addr_in = &ipv4sockAddr->sin_addr;
+        struct sockaddr_in ipv4sockAddr;
+        std::memcpy(&ipv4sockAddr, addr, sizeof(struct sockaddr_in));
+        rc = inet_ntop(family, &ipv4sockAddr.sin_addr, buf.data(), buf.size());
     }
-    else if (addr->sa_family == AF_INET6)
+    else if (family == AF_INET6)
     {
-        const struct sockaddr_in6 *ipv6sockAddr = reinterpret_cast<const struct sockaddr_in6*>(addr);
-        addr_in = &ipv6sockAddr->sin6_addr;
+        struct sockaddr_in6 ipv6sockAddr;
+        std::memcpy(&ipv6sockAddr, addr, sizeof(struct sockaddr_in6));
+        rc = inet_ntop(family, &ipv6sockAddr.sin6_addr, buf.data(), buf.size());
     }
-
-    if (addr_in)
+    else if (family == AF_UNIX)
     {
-        const char *rc = inet_ntop(addr->sa_family, addr_in, buf, INET6_ADDRSTRLEN);
-        if (rc)
-        {
-            std::string remote_addr(rc);
-            return remote_addr;
-        }
+        return std::string("unix");
     }
 
-    return "[unknown address]";
-}
+    if (rc == nullptr)
+        return "[unknown address]";
 
-std::string websocketCloseCodeToString(uint16_t code)
-{
-    switch (code) {
-    case 1000:
-        return "Normal websocket close";
-    case 1001:
-        return "Browser navigating away from page";
-    default:
-        return formatString("Websocket status code %d", code);
-    }
+    std::string remote_addr(rc);
+    return remote_addr;
 }
 
 std::string protocolVersionString(ProtocolVersion p)
@@ -1107,7 +956,91 @@ std::string propertyToString(Mqtt5Properties p)
     return oss.str();
 }
 
+void unlink_if_sock(const std::string &path)
+{
+    if (path.empty())
+        return;
 
+    struct stat statbuf;
+    std::memset(&statbuf, 0, sizeof(statbuf));
+    if (lstat(path.c_str(), &statbuf) < 0)
+        return;
 
+    if ((statbuf.st_mode & S_IFMT) == S_IFSOCK)
+    {
+        unlink(path.c_str());
+    }
+}
 
+void fmq_ensure_fail(const char *file, int line)
+{
+    std::cerr << "Assertion failure: " << file << ", line " << line << "." << std::endl;
+    raise(SIGABRT);
+}
 
+std::optional<SysUserFields> get_pw_name(const std::string &user)
+{
+    struct passwd pwd;
+    struct passwd *result = nullptr;
+    std::memset(&pwd, 0, sizeof(pwd));
+    std::vector<char> buf(16384);
+
+    if (getpwnam_r(user.c_str(), &pwd, buf.data(), buf.size(), &result) != 0)
+    {
+        throw std::runtime_error("getpwnam_r error");
+    }
+
+    if (result == nullptr)
+    {
+        return {};
+    }
+
+    SysUserFields answer;
+    answer.name = pwd.pw_name;
+    answer.uid = pwd.pw_uid;
+    answer.gid = pwd.pw_gid;
+    return answer;
+}
+
+std::optional<SysGroupFields> get_gr_name(const std::string &group)
+{
+    struct group grp;
+    struct group *result = nullptr;
+    std::memset(&grp, 0, sizeof(grp));
+    std::vector<char> buf(16384);
+
+    if (getgrnam_r(group.c_str(), &grp, buf.data(), buf.size(), &result) != 0)
+    {
+        throw std::runtime_error("getgrnam_r error");
+    }
+
+    if (result == nullptr)
+    {
+        return {};
+    }
+
+    SysGroupFields answer;
+    answer.name = group;
+    answer.gid = grp.gr_gid;
+    return answer;
+}
+
+std::optional<unsigned long> try_stoul(const std::string &s) noexcept
+{
+    try
+    {
+        size_t len = 0;
+        unsigned long answer = std::stoul(s, &len);
+
+        if (len != s.length())
+            return {};
+
+        return answer;
+    }
+    catch (std::exception &ex)
+    {
+        return {};
+    }
+
+    return {};
+}

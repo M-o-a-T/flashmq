@@ -26,6 +26,7 @@ See LICENSE for license details.
 #include <sys/random.h>
 #include <stdexcept>
 #include <cassert>
+#include <cstring>
 
 #include "cirbuf.h"
 #include "bindaddr.h"
@@ -34,6 +35,14 @@ See LICENSE for license details.
 #include "threadlocalutils.h"
 
 #define UNUSED(expr) do { (void)(expr); } while (0)
+
+void fmq_ensure_fail(const char *file, int line);
+
+#define FMQ_ENSURE(val) \
+if (!static_cast<bool>(val)) \
+{ \
+    fmq_ensure_fail(__FILE__, __LINE__); \
+}
 
 template<typename T> int check(int rc)
 {
@@ -163,6 +172,7 @@ bool containsDangerousCharacters(const std::string &s);
 
 void ltrim(std::string &s);
 void rtrim(std::string &s);
+void rtrim(std::string &s, char c);
 void trim(std::string &s);
 bool startsWith(const std::string &s, const std::string &needle);
 bool endsWith(const std::string &s, const std::string &ending);
@@ -173,15 +183,9 @@ std::string str_tolower(std::string s);
 bool stringTruthiness(const std::string &val);
 bool isPowerOfTwo(int val);
 
-bool parseHttpHeader(CirBuf &buf, std::string &websocket_key, int &websocket_version, std::string &subprotocol, std::string &xRealIp);
-
 std::vector<char> base64Decode(const std::string &s);
 std::string base64Encode(const unsigned char *input, const int length);
-std::string generateWebsocketAcceptString(const std::string &websocketKey);
 
-std::string generateInvalidWebsocketVersionHttpHeaders(const int wantedVersion);
-std::string generateBadHttpRequestReponse(const std::string &msg);
-std::string generateWebsocketAnswer(const std::string &acceptString, const std::string &subprotocol);
 
 void testSsl(const std::string &fullchain, const std::string &privkey);
 void testSslVerifyLocations(const std::string &caFile, const std::string &caDir, const std::string &error);
@@ -190,11 +194,10 @@ std::string formatString(const std::string str, ...);
 
 std::string_view dirnameOf(std::string_view fname);
 
-BindAddr getBindAddr(int family, const std::string &bindAddress, int port);
-
 size_t getFileSize(const std::string &path);
-size_t getFreeSpace(const std::string &path);
+uint64_t getFreeSpace(const std::string &path);
 
+sa_family_t getFamilyFromSockAddr(const struct sockaddr *addr);
 std::string sockaddrToString(const struct sockaddr *addr);
 
 template<typename ex> void checkWritableDir(const std::string &path)
@@ -223,8 +226,6 @@ template<typename ex> void checkWritableDir(const std::string &path)
         throw ex(msg);
     }
 }
-
-std::string websocketCloseCodeToString(uint16_t code);
 
 std::string protocolVersionString(ProtocolVersion p);
 
@@ -392,5 +393,25 @@ std::optional<T> &non_optional(std::optional<T> &o)
     return o;
 }
 
+void unlink_if_sock(const std::string &path);
+
+struct SysUserFields
+{
+    std::string name;
+    uid_t uid = 0;
+    gid_t gid = 0;
+};
+
+std::optional<SysUserFields> get_pw_name(const std::string &user);
+
+struct SysGroupFields
+{
+    std::string name;
+    gid_t gid = 0;
+};
+
+std::optional<SysGroupFields> get_gr_name(const std::string &group);
+
+std::optional<unsigned long> try_stoul(const std::string &s) noexcept;
 
 #endif // UTILS_H

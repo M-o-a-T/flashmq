@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include "maintests.h"
 #include "testhelpers.h"
 #include "testinitializer.h"
@@ -120,9 +122,8 @@ void MainTests::initBeforeEachTest(const std::vector<std::string> &args, bool st
 
     // We test functions directly that the server normally only calls from worker threads, in which thread data is available. This is kind of a dummy-fix, until
     // we actually need correct thread data at those points (at this point, it's only to increase message counters).
-    PluginLoader pluginLoader;
     this->dummyThreadData = std::make_shared<ThreadData>(666, settings, pluginLoader);
-    ThreadGlobals::assignThreadData(dummyThreadData.get());
+    ThreadGlobals::assignThreadData(dummyThreadData);
     ThreadGlobals::assignSettings(&this->settings);
 }
 
@@ -384,6 +385,9 @@ bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, cons
         {
             std::cout << CYAN << "INIT" << COLOR_END << ": " << pair.first << std::endl;
 
+            if (!isatty(2))
+                std::cerr << "INIT: " << pair.first << std::endl;
+
             TestInitializer testInitializer(this);
             testInitializer.init(tf.requiresServer);
 
@@ -391,6 +395,10 @@ bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, cons
             const int assertCountBefore = assert_count;
 
             std::cout << CYAN << "RUN" << COLOR_END << ": " << pair.first << std::endl;
+
+            if (!isatty(2))
+                std::cerr << "RUN: " << pair.first << std::endl;
+
             tf.f();
 
             const int failCountAfter = assert_fail_count;
@@ -429,6 +437,8 @@ bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, cons
 
         std::cout << std::endl;
     }
+
+    Logger::getInstance()->quit();
 
     std::cout << "Tests run: " << testCount << ". Passed: " << testPassCount << ". Failed: "
               << testFailCount << " (of which " << testExceptionCount << " exceptions). Total assertions: "

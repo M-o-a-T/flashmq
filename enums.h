@@ -39,4 +39,17 @@ enum class OverloadMode
     CloseNewClients
 };
 
+enum class ConnectionProtocol
+{
+    AcmeOnly,
+    Mqtt,
+    WebsocketMqtt
+};
+
+enum class Mqtt3QoSExceedAction
+{
+    Disconnect,
+    Drop
+};
+
 #endif // ENUMS_H

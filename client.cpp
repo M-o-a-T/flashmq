@@ -21,8 +21,11 @@ See LICENSE for license details.
 #include "utils.h"
 #include "threadglobals.h"
 #include "subscriptionstore.h"
-#include "mainapp.h"
 #include "exceptions.h"
+#include "settings.h"
+#include "threaddata.h"
+#include "globals.h"
+#include "http.h"
 
 StowedClientRegistrationData::StowedClientRegistrationData(bool clean_start, uint16_t clientReceiveMax, uint32_t sessionExpiryInterval) :
     clean_start(clean_start),
@@ -57,39 +60,40 @@ Client::WriteBuf::WriteBuf(size_t size) :
  * @param settings The client is constructed in the main thread, so we need to use its settings copy
  * @param fuzzMode
  */
-Client::Client(int fd, std::shared_ptr<ThreadData> threadData, SSL *ssl, bool websocket, bool haproxy, struct sockaddr *addr, const Settings &settings, bool fuzzMode) :
+Client::Client(
+        ClientType type, int fd, std::shared_ptr<ThreadData> threadData, FmqSsl &&ssl, ConnectionProtocol connectionProtocol,
+        bool haproxy, const struct sockaddr *addr, const Settings &settings, bool fuzzMode) :
     fd(fd),
     fuzzMode(fuzzMode),
     maxOutgoingPacketSize(settings.maxPacketSize),
     maxIncomingPacketSize(settings.maxPacketSize),
+    maxQos(settings.maxQos),
+    mqtt3QoSExceedAction(settings.mqtt3QoSExceedAction),
     maxIncomingTopicAliasValue(settings.maxIncomingTopicAliasValue), // Retaining snapshot of current setting, to not confuse clients when the setting changes.
-    ioWrapper(ssl, websocket, settings.clientInitialBufferSize, this),
+    ioWrapper(std::move(ssl), connectionProtocol, settings.clientInitialBufferSize, this),
     readbuf(settings.clientInitialBufferSize),
     writebuf(settings.clientInitialBufferSize),
+    clientType(type),
     epoll_fd(threadData ? threadData->getEpollFd() : 0),
-    threadData(threadData)
+    threadData(threadData),
+    addr(addr)
 {
     ioWrapper.setHaProxy(haproxy);
 
     int flags = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    if (addr)
-        memcpy(&this->addr, addr, sizeof(struct sockaddr_in6));
-    else
-        memset(&this->addr, 0, sizeof(struct sockaddr_in6));
-
-    this->address = sockaddrToString(this->getAddr());
-
     const std::string haproxy_s = haproxy ? "/HAProxy" : "";
     const std::string ssl_s = ssl ? "/SSL" : "/Non-SSL";
-    const std::string websocket_s = websocket ? "/Websocket" : "";
+    const std::string websocket_s = connectionProtocol == ConnectionProtocol::WebsocketMqtt ? "/Websocket" : "";
 
     transportStr = formatString("TCP%s%s%s", haproxy_s.c_str(), websocket_s.c_str(), ssl_s.c_str());
 
     // Avoid giving this log line for dummy clients.
-    if (addr)
-        logger->logf(LOG_NOTICE, "Accepting connection from: %s", repr_endpoint().c_str());
+    if (addr && clientType != ClientType::LocalBridge)
+    {
+        logger->log(LOG_NOTICE) << "Accepting connection from: " << repr_endpoint();
+    }
 }
 
 Client::~Client()
@@ -139,10 +143,13 @@ bool Client::needsHaProxyParsing() const
 
 HaProxyConnectionType Client::readHaProxyData()
 {
-    struct sockaddr* addr = reinterpret_cast<struct sockaddr*>(&this->addr);
-    HaProxyConnectionType result = this->ioWrapper.readHaProxyData(this->fd.get(), addr);
-    this->address = sockaddrToString(this->getAddr());
-    return result;
+    auto result = this->ioWrapper.readHaProxyData(this->fd.get());
+    const std::optional<FMQSockaddr> &new_sock_addr = std::get<std::optional<FMQSockaddr>>(result);
+
+    if (new_sock_addr)
+        addr = new_sock_addr.value();
+
+    return std::get<HaProxyConnectionType>(result);
 }
 
 bool Client::getSslReadWantsWrite() const
@@ -165,7 +172,7 @@ void Client::setProtocolVersion(ProtocolVersion version)
     this->protocolVersion = version;
 }
 
-void Client::connectToBridgeTarget(FMQSockaddr_in6 addr)
+void Client::connectToBridgeTarget(FMQSockaddr addr)
 {
     this->lastActivity = std::chrono::steady_clock::now();
 
@@ -194,6 +201,11 @@ void Client::connectToBridgeTarget(FMQSockaddr_in6 addr)
     assert(rc == 0);
 
     setBridgeConnected();
+}
+
+void Client::setMaxBufSizeOverride(uint32_t val)
+{
+    this->maxBufSizeOverride = val;
 }
 
 void Client::startOrContinueSslHandshake()
@@ -245,12 +257,13 @@ DisconnectStage Client::readFdIntoBuffer()
         {
             const Settings *settings = ThreadGlobals::getSettings();
             // I guess I should have just made a 'max buffer size' option, and not distinguish between read/write?
-            const uint32_t maxBufferSize = std::max<uint32_t>(this->maxIncomingPacketSize, settings->clientMaxWriteBufferSize);
+            const uint32_t maxBufSize = this->maxBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
+            const uint32_t maxBufOrBigPacketSize= std::max<uint32_t>(this->maxIncomingPacketSize, maxBufSize);
 
             // We always grow for another iteration when there are still decoded websocket/SSL bytes, because epoll doesn't tell us that buffer has data.
-            if (readbuf.getSize() * 2 <= maxBufferSize || error == IoWrapResult::WantRead || ioWrapper.hasProcessedBufferedBytesToRead())
+            if (readbuf.getCapacity() * 2 <= maxBufOrBigPacketSize || error == IoWrapResult::WantRead || ioWrapper.hasProcessedBufferedBytesToRead())
             {
-                readbuf.doubleSize();
+                readbuf.doubleCapacity();
             }
             else
             {
@@ -269,7 +282,7 @@ DisconnectStage Client::readFdIntoBuffer()
 
 void Client::writeText(const std::string &text)
 {
-    assert(ioWrapper.isWebsocket());
+    assert(ioWrapper.getConnectionProtocol() == ConnectionProtocol::WebsocketMqtt || !authenticated );
     assert(ioWrapper.getWebsocketState() == WebsocketState::NotUpgraded);
 
     auto write_buf_locked = writebuf.lock();
@@ -298,7 +311,8 @@ PacketDropReason Client::writeMqttPacket(const MqttPacket &packet)
     const Settings *settings = ThreadGlobals::getSettings();
 
     // After introducing the client_max_write_buffer_size with low default, this makes it somewhat backwards compatible with the default big packet size.
-    const uint32_t growBufMaxTo = std::max<uint32_t>(settings->clientMaxWriteBufferSize, packetSize * 2);
+    const uint32_t maxBufSize = this->maxBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
+    const uint32_t growBufMaxTo = std::max<uint32_t>(maxBufSize, packetSize * 2);
 
     auto write_buf_locked = writebuf.lock();
 
@@ -316,7 +330,7 @@ PacketDropReason Client::writeMqttPacket(const MqttPacket &packet)
 
     if (packet.packetType == PacketType::PUBLISH)
     {
-        ThreadData *td = ThreadGlobals::getThreadData();
+        ThreadData *td = ThreadGlobals::getThreadData().get();
         td->sentMessageCounter.inc();
     }
     else if (packet.packetType == PacketType::DISCONNECT)
@@ -436,6 +450,7 @@ void Client::writeLoginPacket()
     connectInfo.sessionExpiryInterval = config->c.remoteSessionExpiryInterval;
     connectInfo.maxIncomingTopicAliasValue = config->c.maxIncomingTopicAliases;
     connectInfo.bridgeProtocolBit = config->c.bridgeProtocolBit;
+    connectInfo.fmq_client_group_id = config->c.getFmqClientGroupId();
 
     MqttPacket pack(connectInfo);
     writeMqttPacket(pack);
@@ -476,9 +491,9 @@ void Client::writeBufIntoFd()
     setReadyForWriting(data_pending, write_buf_locked);
 }
 
-const sockaddr *Client::getAddr() const
+const FMQSockaddr &Client::getAddr() const
 {
-    return reinterpret_cast<const struct sockaddr*>(&this->addr);
+    return this->addr;
 }
 
 std::string Client::repr()
@@ -497,16 +512,27 @@ std::string Client::repr()
         transport = transport + " (" + ssl_version + ")";
     }
 
-    std::string s = formatString("[%sClientID='%s', username='%s', fd=%d, keepalive=%ds, transport='%s', address='%s', prot=%s, clean=%d]",
-                                 bridge.c_str(), clientid.c_str(), username.c_str(), fd.get(), keepalive, transport.c_str(), this->address.c_str(),
-                                 protocolVersionString(protocolVersion).c_str(), this->clean_start);
+    std::string fmq_client_group_id_part;
+
+    if (this->fmq_client_group_id)
+    {
+        fmq_client_group_id_part.append("fmq_client_group_id='");
+        fmq_client_group_id_part.append(this->fmq_client_group_id.value());
+        fmq_client_group_id_part.append("', ");
+    }
+
+    std::string s = formatString(
+        "[%sClientID='%s', %susername='%s', fd=%d, keepalive=%ds, transport='%s', address='%s', prot=%s, clean=%d]",
+        bridge.c_str(), clientid.c_str(), fmq_client_group_id_part.c_str(), username.c_str(), fd.get(), keepalive,
+        transport.c_str(), this->addr.getText().c_str(), protocolVersionString(protocolVersion).c_str(), this->clean_start);
+
     return s;
 }
 
 std::string Client::repr_endpoint()
 {
     std::string s = formatString("address='%s', transport='%s', fd=%d",
-                                 this->address.c_str(), this->transportStr.c_str(), fd.get());
+                                 this->addr.getText().c_str(), this->transportStr.c_str(), fd.get());
     return s;
 }
 
@@ -544,11 +570,11 @@ void Client::resetBuffersIfEligible()
     const Settings *settings = ThreadGlobals::getSettings();
     const size_t initialBufferSize = settings->clientInitialBufferSize;
 
-    readbuf.resetSizeIfEligable(initialBufferSize);
+    readbuf.resetCapacityIfEligable(initialBufferSize);
     ioWrapper.resetBuffersIfEligible();
 
     auto write_buf_locked = writebuf.lock();
-    write_buf_locked->buf.resetSizeIfEligable(initialBufferSize);
+    write_buf_locked->buf.resetCapacityIfEligable(initialBufferSize);
 }
 
 void Client::setTopicAlias(const uint16_t alias_id, const std::string &topic)
@@ -604,7 +630,7 @@ void Client::sendOrQueueWill()
     if (!this->willPublish)
         return;
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     store->queueOrSendWillMessage(willPublish, session);
     this->willPublish.reset();
 }
@@ -705,11 +731,12 @@ void Client::setBridgeState(std::shared_ptr<BridgeState> bridgeState)
     if (bridgeState)
     {
         this->protocolVersion = bridgeState->c.protocolVersion;
-        this->address = bridgeState->c.address;
         this->clean_start = bridgeState->c.localCleanStart;
         this->clientid = bridgeState->c.getClientid();
+        this->fmq_client_group_id = bridgeState->c.getFmqClientGroupId();
         this->username = bridgeState->c.local_username.value_or(std::string());
         this->keepalive = bridgeState->c.keepalive;
+        this->addr.setAddressName(bridgeState->c.address);
 
         // Not setting maxOutgoingTopicAliasValue, because that must remain 0 until the other side says (in the connack) we can uses aliases.
         this->maxIncomingTopicAliasValue = bridgeState->c.maxIncomingTopicAliases;
@@ -847,35 +874,58 @@ void Client::setAddr(const std::string &address)
 {
     const Settings *settings = ThreadGlobals::getSettings();
 
-    if (!settings->matchAddrWithSetRealIpFrom(&this->addr))
+    if (!settings->matchAddrWithSetRealIpFrom(this->addr.getSockaddr()))
         return;
 
-    bool success = false;
+    addr.setAddress(address);
+}
 
+bool Client::tryAcmeRedirect()
+{
+    if (authenticated)
+        return false;
+
+    if (isSsl())
+        return false;
+
+    if (getConnectionProtocol() == ConnectionProtocol::AcmeOnly && !acmeRedirectUrl)
+        throw std::runtime_error("ACME-only client has no redirect URL.");
+
+    if (!acmeRedirectUrl)
+        return false;
+
+    std::optional<HttpRequest> req = parseHttpHeader(readbuf);
+
+    if (!req)
+        return false;
+
+    if (!req.value())
+        return false;
+
+    const HttpRequest::Data &d = req.value().value();
+
+    if (startsWith(d.request, "/.well-known/acme-challenge/"))
     {
-        struct sockaddr_in *a = reinterpret_cast<struct sockaddr_in*>(&this->addr);
-        success = inet_pton(AF_INET, address.c_str(), &a->sin_addr) > 0;
-        if (success)
-        {
-            a->sin_port = 0;
-            a->sin_family = AF_INET;
-        }
+        respondWithRedirectURL(d.request);
+        return true;
     }
 
-    if (!success)
-    {
-        success = inet_pton(AF_INET6, address.c_str(), &this->addr.sin6_addr) > 0;
-        if (success)
-        {
-            this->addr.sin6_port = 0;
-            this->addr.sin6_family = AF_INET6;
-        }
-    }
+    return false;
+}
 
-    if (success)
-    {
-        this->address = sockaddrToString(this->getAddr());
-    }
+void Client::respondWithRedirectURL(const std::string &request)
+{
+    if (!acmeRedirectUrl)
+        throw std::runtime_error("Trying to redirect ACME without URL defined.");
+
+    std::string redirected_request = *acmeRedirectUrl;
+    rtrim(redirected_request, '/');
+    redirected_request.append(request);
+
+    std::string response = generateRedirect(redirected_request);
+    writeText(response);
+    setDisconnectReason("Redirecting ACME request");
+    setDisconnectStage(DisconnectStage::SendPendingAppData);
 }
 
 void Client::bufferToMqttPackets(std::vector<MqttPacket> &packetQueueIn, std::shared_ptr<Client> &sender)
@@ -884,19 +934,23 @@ void Client::bufferToMqttPackets(std::vector<MqttPacket> &packetQueueIn, std::sh
     setReadyForReading(readbuf.freeSpace() > 0);
 }
 
-void Client::setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::string username, bool connectPacketSeen, uint16_t keepalive)
+void Client::setClientProperties(
+    ProtocolVersion protocolVersion, const std::string &clientId, const std::optional<std::string> &fmq_client_group_id, const std::string username,
+    bool connectPacketSeen, uint16_t keepalive)
 {
     const Settings *settings = ThreadGlobals::getSettings();
 
-    setClientProperties(protocolVersion, clientId, username, connectPacketSeen, keepalive, settings->maxPacketSize, 0);
+    setClientProperties(protocolVersion, clientId, fmq_client_group_id, username, connectPacketSeen, keepalive, settings->maxPacketSize, 0);
 }
 
 
-void Client::setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::string username, bool connectPacketSeen, uint16_t keepalive,
-                                 uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue)
+void Client::setClientProperties(
+    ProtocolVersion protocolVersion, const std::string &clientId, const std::optional<std::string> &fmq_client_group_id, const std::string username,
+    bool connectPacketSeen, uint16_t keepalive, uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue)
 {
     this->protocolVersion = protocolVersion;
     this->clientid = clientId;
+    this->fmq_client_group_id = fmq_client_group_id;
     this->username = username;
     this->connectPacketSeen = connectPacketSeen;
     this->keepalive = keepalive;
@@ -948,7 +1002,7 @@ void Client::setDisconnectReason(const std::string &reason)
     auto td = this->threadData.lock();
     if (td)
     {
-        assert(pthread_self() == td->thread.native_handle());
+        assert(pthread_self() == td->thread_id);
     }
 #endif
 #endif
@@ -1084,6 +1138,12 @@ void Client::setAllowAnonymousOverride(const AllowListenerAnonymous allow)
 AllowListenerAnonymous Client::getAllowAnonymousOverride() const
 {
     return allowAnonymousOverride;
+}
+
+void Client::setAcmeRedirect(const std::optional<std::string> &url)
+{
+    if (url)
+        this->acmeRedirectUrl = std::make_unique<std::string>(url.value());
 }
 
 void Client::addPacketToAfterAsyncQueue(MqttPacket &&p)

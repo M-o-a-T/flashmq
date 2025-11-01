@@ -31,6 +31,7 @@ See LICENSE for license details.
 #include "bridgeinfodb.h"
 #include "backgroundworker.h"
 #include "driftcounter.h"
+#include "globals.h"
 
 class MainApp
 {
@@ -44,7 +45,7 @@ class MainApp
 
     bool started = false;
     bool running = true;
-    std::vector<std::shared_ptr<ThreadData>> threads;
+    std::vector<ThreadDataOwner> threads;
     std::shared_ptr<SubscriptionStore> subscriptionStore;
     std::unique_ptr<ConfigFileParser> confFileParser;
     int epollFdAccept = -1;
@@ -64,7 +65,7 @@ class MainApp
     std::list<std::shared_ptr<Listener>> listeners;
     std::unordered_map<int, ScopedSocket> activeListenSockets;
 
-    std::unordered_map<std::string, std::shared_ptr<BridgeConfig>> bridgeConfigs;
+    std::unordered_map<std::string, BridgeConfig> bridgeConfigs;
     std::mutex quitMutex;
     std::string fuzzFilePath;
     OneInstanceLock oneInstanceLock;
@@ -90,7 +91,7 @@ class MainApp
     void queuePublishStatsOnDollarTopic();
     static void saveState(const Settings &settings, const std::list<BridgeInfoForSerializing> &bridgeInfos, bool in_background);
     static void saveBridgeInfo(const std::string &filePath, const std::list<BridgeInfoForSerializing> &bridgeInfos);
-    static std::list<std::shared_ptr<BridgeConfig>> loadBridgeInfo(Settings &settings);
+    static std::list<BridgeConfig> loadBridgeInfo(Settings &settings);
     void saveStateInThread();
     void queueSendQueuedWills();
     void waitForWillsQueued();
@@ -118,8 +119,6 @@ public:
     void queuePurgeSubscriptionTree();
     void queueMemoryTrim();
     void memoryTrim();
-
-    std::shared_ptr<SubscriptionStore> getSubscriptionStore();
 };
 
 #endif // MAINAPP_H

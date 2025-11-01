@@ -113,7 +113,7 @@ void MainTests::test_circbuf_unwrapped_doubling()
     MYCASTCOMPARE(buf.head, 63);
     MYCASTCOMPARE(buf.freeSpace(), 0);
 
-    buf.doubleSize();
+    buf.doubleCapacity();
     tail = buf.tailPtr();
 
     for (int i = 0; i < w; i++)
@@ -178,7 +178,7 @@ void MainTests::test_circbuf_wrapped_doubling()
     buf.advanceHead(10);
     MYCASTCOMPARE(buf.head, 10);
 
-    buf.doubleSize();
+    buf.doubleCapacity();
 
     // The 88's that were appended at the start, should now appear at the end;
     for (int i = 64; i < 74; i++)
@@ -216,7 +216,7 @@ void MainTests::test_circbuf_full_wrapped_buffer_doubling()
 
     QVERIFY(true);
 
-    buf.doubleSize();
+    buf.doubleCapacity();
 
     // The places where value was 1 are the same
     for (int i = 10; i < 64; i++)
@@ -258,7 +258,7 @@ void MainTests::test_cirbuf_vector_methods()
         FMQ_COMPARE(target.freeSpace(), static_cast<uint32_t>(63));
 
         if (i % 64 == 0)
-            target.resetSize(8);
+            target.resetCapacity(8);
     }
 }
 
@@ -960,23 +960,18 @@ void MainTests::testSavingSessions()
     try
     {
         Settings settings;
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
 
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
-
-        std::shared_ptr<Client> c1(new Client(0, t, nullptr, false, false, nullptr, settings, false));
-        c1->setClientProperties(ProtocolVersion::Mqtt5, "c1", "user1", true, 60);
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+        c1->setClientProperties(ProtocolVersion::Mqtt5, "c1", {}, "user1", true, 60);
         store->registerClientAndKickExistingOne(c1, false, 512, 120);
         c1->getSession()->addIncomingQoS2MessageId(2);
         c1->getSession()->addIncomingQoS2MessageId(3);
 
-        std::shared_ptr<Client> c2(new Client(0, t, nullptr, false, false, nullptr, settings, false));
-        c2->setClientProperties(ProtocolVersion::Mqtt5, "c2", "user2", true, 60);
+        std::shared_ptr<Client> c2(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+        c2->setClientProperties(ProtocolVersion::Mqtt5, "c2", {}, "user2", true, 60);
         store->registerClientAndKickExistingOne(c2, false, 512, 120);
         c2->getSession()->addOutgoingQoS2MessageId(55);
         c2->getSession()->addOutgoingQoS2MessageId(66);
@@ -1124,15 +1119,11 @@ void MainTests::testParsePacketHelper(const std::string &topic, uint8_t from_qos
     Settings settings;
     settings.logLevel = LogLevel::Info;
     std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
-    PluginLoader pluginLoader;
+    std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
     std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
 
-    // Kind of a hack...
-    Authentication auth(settings);
-    ThreadGlobals::assign(&auth);
-
-    std::shared_ptr<Client> dummyClient(new Client(0, t, nullptr, false, false, nullptr, settings, false));
-    dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "qostestclient", "user1", true, 60);
+    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "qostestclient", {}, "user1", true, 60);
     store->registerClientAndKickExistingOne(dummyClient, false, 512, 120);
 
     uint16_t packetid = 66;
@@ -1196,17 +1187,13 @@ void MainTests::testbufferToMqttPacketsFuzz()
     Settings settings;
     settings.logLevel = LogLevel::Info;
     std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
-    PluginLoader pluginLoader;
+    std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
     std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-    // Kind of a hack...
-    Authentication auth(settings);
-    ThreadGlobals::assign(&auth);
 
     settings.maxPacketSize = 32768;
 
-    std::shared_ptr<Client> dummyClient(new Client(0, t, nullptr, false, false, nullptr, settings, false));
-    dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "dummy", "user1", true, 60);
+    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "dummy", {}, "user1", true, 60);
     store->registerClientAndKickExistingOne(dummyClient, false, 512, 120);
 
     // To avoid the restriction on packet size for unauthenticated clients.
@@ -3074,14 +3061,14 @@ void MainTests::testTopicMatchingInSubscriptionTreeHelper(const std::string &sub
 
     std::shared_ptr<ThreadData> td;
     const Settings *settings = ThreadGlobals::getSettings();
-    std::shared_ptr<Client> client = std::make_shared<Client>(0, td, nullptr, false, false, nullptr, *settings, false);
-    client->setClientProperties(ProtocolVersion::Mqtt5, "mytestclient", "myusername", true, 60);
+    std::shared_ptr<Client> client = std::make_shared<Client>(ClientType::Normal, 0, td, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, *settings, false);
+    client->setClientProperties(ProtocolVersion::Mqtt5, "mytestclient", {}, "myusername", true, 60);
     store.registerClientAndKickExistingOne(client);
 
     store.addSubscription(client->getSession(), subscribe_subtopics, 0, false, false, "", 0);
 
     std::vector<ReceivingSubscriber> receivers;
-    store.publishRecursively(publish_subtopics.begin(), publish_subtopics.end(), store.root.get(), receivers, "fakeclientid");
+    store.publishRecursively(publish_subtopics.begin(), publish_subtopics.end(), store.root.get(), receivers, "fakeclientid", {});
 
     QVERIFY2(std::distance(receivers.begin(), receivers.end()) == match_count, publish_topic.c_str());
 }

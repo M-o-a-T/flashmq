@@ -22,6 +22,9 @@ See LICENSE for license details.
 #include "haproxy.h"
 #include "cirbuf.h"
 #include "x509manager.h"
+#include "fmqsockaddr.h"
+#include "enums.h"
+#include "fmqssl.h"
 
 #define WEBSOCKET_MIN_HEADER_BYTES_NEEDED 2
 #define WEBSOCKET_MAX_SENDING_HEADER_SIZE 10
@@ -99,13 +102,13 @@ class IoWrapper
 {
     Client *parentClient;
 
-    SSL *ssl = nullptr;
+    FmqSsl ssl;
     bool sslAccepted = false;
     IncompleteSslWrite incompleteSslWrite;
     bool sslReadWantsWrite = false;
     bool sslWriteWantsRead = false;
 
-    bool websocket;
+    ConnectionProtocol connectionProtocol;
     WebsocketState websocketState = WebsocketState::NotUpgraded;
     CirBuf websocketPendingBytes;
     IncompleteWebsocketRead incompleteWebsocketRead;
@@ -124,8 +127,8 @@ class IoWrapper
     void startOrContinueSslAccept();
 
 public:
-    IoWrapper(SSL *ssl, bool websocket, const size_t initialBufferSize, Client *parent);
-    ~IoWrapper();
+    IoWrapper(FmqSsl &&ssl, ConnectionProtocol connectionProtocol, const size_t initialBufferSize, Client *parent);
+    ~IoWrapper() = default;
 
     void startOrContinueSslHandshake();
     bool getSslReadWantsWrite() const;
@@ -135,13 +138,13 @@ public:
     void setSslVerify(int mode, const std::string &hostname);
     bool hasPendingWrite() const;
     bool hasProcessedBufferedBytesToRead() const;
-    bool isWebsocket() const;
+    ConnectionProtocol getConnectionProtocol() const { return this->connectionProtocol; };
     WebsocketState getWebsocketState() const;
     X509Manager getPeerCertificate() const;
     const char *getSslVersion() const;
 
     bool needsHaProxyParsing() const;
-    HaProxyConnectionType readHaProxyData(int fd, struct sockaddr *addr);
+    std::tuple<HaProxyConnectionType, std::optional<FMQSockaddr>> readHaProxyData(int fd);
     void setHaProxy(bool val);
 
 #ifndef NDEBUG

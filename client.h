@@ -32,6 +32,7 @@ See LICENSE for license details.
 #include "enums.h"
 #include "fdmanaged.h"
 #include "mutexowned.h"
+#include "fmqssl.h"
 
 #include "publishcopyfactory.h"
 
@@ -92,13 +93,15 @@ class Client
 
     uint32_t maxOutgoingPacketSize;
     const uint32_t maxIncomingPacketSize;
+    std::optional<uint32_t> maxBufSizeOverride;
+    uint8_t maxQos = 2;
+    Mqtt3QoSExceedAction mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
 
     uint16_t maxOutgoingTopicAliasValue = 0;
     uint16_t maxIncomingTopicAliasValue = 0;
 
     IoWrapper ioWrapper;
     std::string transportStr;
-    std::string address;
 
     CirBuf readbuf;
     MutexOwned<WriteBuf> writebuf;
@@ -117,10 +120,13 @@ class Client
     std::string ssl_version;
     std::string clientid;
     std::string username;
+    std::optional<std::string> fmq_client_group_id;
     uint16_t keepalive = 10;
     bool clean_start = false;
     X509ClientVerification x509ClientVerification = X509ClientVerification::None;
     AllowListenerAnonymous allowAnonymousOverride = AllowListenerAnonymous::None;
+
+    std::unique_ptr<std::string> acmeRedirectUrl;
 
     std::shared_ptr<WillPublish> stagedWillPublish;
     std::shared_ptr<WillPublish> willPublish;
@@ -141,7 +147,7 @@ class Client
 
     Logger *logger = Logger::getInstance();
 
-    sockaddr_in6 addr;
+    FMQSockaddr addr;
 
     std::weak_ptr<BridgeState> bridgeState;
 
@@ -157,7 +163,9 @@ class Client
 public:
     uint8_t preAuthPacketCounter = 0;
 
-    Client(int fd, std::shared_ptr<ThreadData> threadData, SSL *ssl, bool websocket, bool haproxy, struct sockaddr *addr, const Settings &settings, bool fuzzMode=false);
+    Client(
+        ClientType type, int fd, std::shared_ptr<ThreadData> threadData, FmqSsl &&ssl, ConnectionProtocol connectionProtocol, bool haproxy,
+        const struct sockaddr *addr, const Settings &settings, bool fuzzMode=false);
     Client(const Client &other) = delete;
     Client(Client &&other) = delete;
     ~Client();
@@ -170,16 +178,21 @@ public:
     bool getSslReadWantsWrite() const;
     bool getSslWriteWantsRead() const;
     ProtocolVersion getProtocolVersion() const;
+    ConnectionProtocol getConnectionProtocol() const { return this->ioWrapper.getConnectionProtocol(); }
     void setProtocolVersion(ProtocolVersion version);
-    void connectToBridgeTarget(FMQSockaddr_in6 addr);
+    void connectToBridgeTarget(FMQSockaddr addr);
 
+    void setMaxBufSizeOverride(uint32_t val);
     void startOrContinueSslHandshake();
     void setDisconnectStage(DisconnectStage val);
     DisconnectStage readFdIntoBuffer();
+    bool tryAcmeRedirect();
+    void respondWithRedirectURL(const std::string &request);
     void bufferToMqttPackets(std::vector<MqttPacket> &packetQueueIn, std::shared_ptr<Client> &sender);
-    void setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::string username, bool connectPacketSeen, uint16_t keepalive);
-    void setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::string username, bool connectPacketSeen, uint16_t keepalive,
-                             uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue);
+    void setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::optional<std::string> &fmq_client_group_id,
+                             const std::string username, bool connectPacketSeen, uint16_t keepalive);
+    void setClientProperties(ProtocolVersion protocolVersion, const std::string &clientId, const std::optional<std::string> &fmq_client_group_id,
+                             const std::string username, bool connectPacketSeen, uint16_t keepalive, uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue);
     void setClientProperties(bool connectPacketSeen, uint16_t keepalive, uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue, bool supportsRetained);
     void setWill(const std::string &topic, const std::string &payload, bool retain, uint8_t qos);
     void stageWill(WillPublish &&willPublish);
@@ -192,6 +205,7 @@ public:
     const std::string &getClientId() { return this->clientid; }
     void setClientId(const std::string &id);
     const std::string &getUsername() const { return this->username; }
+    const std::optional<std::string> &getFmqClientGroupId() const { return this->fmq_client_group_id; }
     std::string &getMutableUsername();
     std::shared_ptr<WillPublish> &getWill() { return this->willPublish; }
     const std::shared_ptr<WillPublish> &getStagedWill() { return this->stagedWillPublish; }
@@ -214,7 +228,7 @@ public:
     void writeBufIntoFd();
     DisconnectStage getDisconnectStage() const { return disconnectStage; }
 
-    const sockaddr *getAddr() const;
+    const FMQSockaddr &getAddr() const;
     std::string repr();
     std::string repr_endpoint();
     bool keepAliveExpired();
@@ -265,6 +279,8 @@ public:
     X509ClientVerification getX509ClientVerification() const;
     void setAllowAnonymousOverride(const AllowListenerAnonymous allow);
     AllowListenerAnonymous getAllowAnonymousOverride() const;
+    void setAcmeRedirect(const std::optional<std::string> &url);
+    const std::unique_ptr<std::string> &getAcmeRedirectUrl() const { return this->acmeRedirectUrl; };
 
     void setAsyncAuthenticating() { this->asyncAuthenticating = true; }
     bool getAsyncAuthenticating() const { return this->asyncAuthenticating; }
@@ -273,6 +289,12 @@ public:
     void setAsyncAuthResult(const AsyncAuthResult &v);
     bool hasAsyncAuthResult() const { return this->asyncAuthResult.operator bool() ; }
     std::unique_ptr<AsyncAuthResult> stealAsyncAuthResult();
+    bool getCleanStart() const { return clean_start;}
+    Mqtt3QoSExceedAction getMqtt3QoSExceedAction() const { return this->mqtt3QoSExceedAction;}
+    void setMqtt3QoSExceedAction(Mqtt3QoSExceedAction action) { this->mqtt3QoSExceedAction = action;}
+    uint8_t getMaxQos() const { return this->maxQos; }
+    void setMaxQos(uint8_t qos) { this->maxQos = qos; }
+
 
 };
 

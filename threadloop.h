@@ -13,6 +13,7 @@ See LICENSE for license details.
 
 #define MAX_EVENTS 65536
 
+#include <cstdint>
 #include <vector>
 #include "forward_declarations.h"
 
@@ -44,7 +45,7 @@ struct ReadyClient
     ReadyClient(uint32_t events, std::shared_ptr<Client> &&client);
 };
 
-void do_thread_work(ThreadData *threadData);
+void do_thread_work(std::shared_ptr<ThreadData> threadData);
 
 
 #endif // THREADLOOP_H

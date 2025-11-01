@@ -15,7 +15,7 @@ See LICENSE for license details.
 #include "threaddata.h"
 #include "threadglobals.h"
 #include "subscriptionstore.h"
-#include "mainapp.h"
+#include "globals.h"
 #include "utils.h"
 
 void flashmq_logf(int level, const char *str, ...)
@@ -33,7 +33,7 @@ void flashmq_logf(int level, const char *str, ...)
  */
 void flashmq_plugin_remove_client(const std::string &clientid, bool alsoSession, ServerDisconnectReasons reasonCode)
 {
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     std::shared_ptr<Session> session = store->lockSession(clientid);
 
     if (session)
@@ -58,7 +58,7 @@ void flashmq_plugin_remove_client(const std::string &clientid, bool alsoSession,
 
 void flashmq_plugin_remove_client_v4(const std::weak_ptr<Session> &session, bool alsoSession, ServerDisconnectReasons reasonCode)
 {
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     if (!store) return;
     std::shared_ptr<Session> session_locked = session.lock();
     if (!session_locked) return;
@@ -82,7 +82,7 @@ void flashmq_plugin_remove_subscription(const std::string &clientid, const std::
     if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
         throw std::runtime_error("Unsubscribing from plugin failed: invalid topic filter: " + topicFilter);
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     std::shared_ptr<Session> session = store->lockSession(clientid);
     if (!session) return;
 
@@ -99,7 +99,7 @@ void flashmq_plugin_remove_subscription_v4(const std::weak_ptr<Session> &session
     if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
         throw std::runtime_error("Unsubscribing from plugin failed: invalid topic filter: " + topicFilter);
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     std::shared_ptr<Session> session_locked = session.lock();
     if (!session_locked) return;
 
@@ -118,7 +118,7 @@ bool flashmq_plugin_add_subscription(
     if (!(isValidUtf8(topicFilter) && isValidSubscribePath(topicFilter)))
         throw std::runtime_error("Subscribing from plugin failed: invalid topic filter: " + topicFilter);
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     if (!store) return false;
     std::shared_ptr<Session> session_locked = session.lock();
     if (!session_locked) return false;
@@ -182,7 +182,7 @@ void flashmq_publish_message(const std::string &topic, const uint8_t qos, const 
         pub.contentType = *contentType;
     }
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
 
     if (pub.retain)
     {
@@ -190,30 +190,61 @@ void flashmq_publish_message(const std::string &topic, const uint8_t qos, const 
     }
 
     PublishCopyFactory factory(&pub);
-    store->queuePacketAtSubscribers(factory, "");
+    store->queuePacketAtSubscribers(factory, "", {});
 }
 
 
 
 void flashmq_get_client_address(const std::weak_ptr<Client> &client, std::string *text, FlashMQSockAddr *addr)
 {
+    if (addr)
+    {
+        std::memset(addr, 0, sizeof(FlashMQSockAddr));
+    }
+
     std::shared_ptr<Client> c = client.lock();
 
     if (!c)
         return;
 
-    const struct sockaddr *orgAddr = c->getAddr();
+    const FMQSockaddr &client_addr = c->getAddr();
 
     if (text)
-        *text = sockaddrToString(orgAddr);
+        *text = client_addr.getText();
 
     if (addr)
-        memcpy(addr->getAddr(), orgAddr, addr->getLen());
+    {
+        const socklen_t addrlen_min = std::min<socklen_t>(client_addr.getSize(), sizeof(FlashMQSockAddr));
+        memcpy(addr->getAddr(), client_addr.getData(), addrlen_min);
+    }
+}
+
+void flashmq_get_client_address_v4(const std::weak_ptr<Client> &client, std::string *text, sockaddr *addr, socklen_t *addrlen)
+{
+    if (addr && addrlen)
+        std::memset(addr, 0, *addrlen);
+
+    std::shared_ptr<Client> c = client.lock();
+
+    if (!c)
+        return;
+
+    const FMQSockaddr &client_addr = c->getAddr();
+
+    if (text)
+        *text = client_addr.getText();
+
+    if (addr && addrlen)
+    {
+        const socklen_t addrlen_min = std::min<socklen_t>(client_addr.getSize(), *addrlen);
+        memcpy(addr, client_addr.getData(), addrlen_min);
+        *addrlen = addrlen_min;
+    }
 }
 
 void flashmq_poll_add_fd(int fd, uint32_t events, const std::weak_ptr<void> &p)
 {
-    ThreadData *d = ThreadGlobals::getThreadData();
+    ThreadData *d = ThreadGlobals::getThreadData().get();
 
     if (!d)
         return;
@@ -223,7 +254,7 @@ void flashmq_poll_add_fd(int fd, uint32_t events, const std::weak_ptr<void> &p)
 
 void flashmq_poll_remove_fd(uint32_t fd)
 {
-    ThreadData *d = ThreadGlobals::getThreadData();
+    ThreadData *d = ThreadGlobals::getThreadData().get();
 
     if (!d)
         return;
@@ -243,7 +274,7 @@ constexpr int FlashMQSockAddr::getLen()
 
 uint32_t flashmq_add_task(std::function<void ()> f, uint32_t delay_in_ms)
 {
-    ThreadData *d = ThreadGlobals::getThreadData();
+    std::shared_ptr<ThreadData> d = ThreadGlobals::getThreadData();
 
     if (!d)
         throw std::runtime_error("No thread data?");
@@ -253,7 +284,7 @@ uint32_t flashmq_add_task(std::function<void ()> f, uint32_t delay_in_ms)
 
 void flashmq_remove_task(uint32_t id)
 {
-    ThreadData *d = ThreadGlobals::getThreadData();
+    std::shared_ptr<ThreadData> d = ThreadGlobals::getThreadData();
 
     if (!d)
         return;
@@ -263,7 +294,7 @@ void flashmq_remove_task(uint32_t id)
 
 void flashmq_get_session_pointer(const std::string &clientid, const std::string &username, std::weak_ptr<Session> &sessionOut)
 {
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     if (!store) return;
     std::shared_ptr<Session> session = store->lockSession(clientid);
     if (!session) return;

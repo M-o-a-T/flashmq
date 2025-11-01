@@ -13,15 +13,15 @@ See LICENSE for license details.
 #include "session.h"
 #include "client.h"
 #include "threadglobals.h"
-#include "threadglobals.h"
+#include "threaddata.h"
 #include "exceptions.h"
 #include "plugin.h"
 #include "settings.h"
 
-
-Session::Session(const std::string &clientid, const std::string &username) :
+Session::Session(const std::string &clientid, const std::string &username, const std::optional<std::string> &fmq_client_group_id) :
     client_id(clientid),
     username(username),
+    fmq_client_group_id(fmq_client_group_id),
 
     // Sessions also get defaults from the handleConnect() method, but when you create sessions elsewhere, we do need some sensible defaults.
     qos(ThreadGlobals::getSettings()->maxQosMsgPendingPerClient)
@@ -129,10 +129,7 @@ PacketDropReason Session::writePacket(PublishCopyFactory &copyFactory, const uin
     retainAsPublished = retainAsPublished || clientType == ClientType::Mqtt3DefactoBridge;
     bool effectiveRetain = copyFactory.getEffectiveRetain(retainAsPublished);
 
-    Authentication *auth = ThreadGlobals::getAuth();
-    assert(auth);
-
-    const AuthResult aclResult = auth->aclCheck(
+    const AuthResult aclResult = ThreadGlobals::getThreadData()->authentication.aclCheck(
         client_id, username, copyFactory.getTopic(), copyFactory.getSubtopics(), "", copyFactory.getPayload(), AclAccess::read,
         effectiveQos, effectiveRetain, copyFactory.getCorrelationData(), copyFactory.getResponseTopic(), copyFactory.getUserProperties());
 
@@ -263,7 +260,7 @@ bool Session::clearQosMessage(uint16_t packet_id, bool qosHandshakeEnds)
  */
 void Session::sendAllPendingQosData()
 {
-    Authentication &authentication = *ThreadGlobals::getAuth();
+    Authentication &authentication = ThreadGlobals::getThreadData()->authentication;
 
     std::shared_ptr<Client> c = makeSharedClient();
     if (c)
@@ -274,11 +271,11 @@ void Session::sendAllPendingQosData()
         {
             MutexLocked<QoSData> qos_locked = qos.lock();
 
-            std::shared_ptr<QueuedPublish> qp_ = qos_locked->qosPacketQueue.getTail();;
+            std::shared_ptr<QueuedPublish> qp_ = qos_locked->qosPacketQueue.getTail();
             while (qp_)
             {
                 std::shared_ptr<QueuedPublish> qp = qp_;
-                qp_ = qp_->next;
+                qp_ = qp_->next.lock();
 
                 Publish &pub = qp->getPublish();
 

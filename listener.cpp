@@ -15,6 +15,7 @@ See LICENSE for license details.
 #include "utils.h"
 #include "exceptions.h"
 #include "logger.h"
+#include "configfileparser.h"
 
 void Listener::isValid()
 {
@@ -22,24 +23,62 @@ void Listener::isValid()
     {
         if (port == 0)
         {
-            if (websocket)
+            if (connectionProtocol == ConnectionProtocol::WebsocketMqtt)
                 port = 4443;
             else
                 port = 8883;
         }
 
-        testSsl(sslFullchain, sslPrivkey);
+        if (acmeRedirectURL)
+        {
+            throw ConfigFileException("An SSL listener can't have an acme_redirect_url.");
+        }
+
+        if (!dropListener())
+        {
+            ConfigFileParser::checkFileExistsAndReadable("SSL fullchain", sslFullchain, 1024*1024);
+            ConfigFileParser::checkFileExistsAndReadable("SSL privkey", sslPrivkey, 1024*1024);
+            testSsl(sslFullchain, sslPrivkey);
+        }
+
         testSslVerifyLocations(clientVerificationCaFile, clientVerificationCaDir, "Loading client_verification_ca_dir/client_verification_ca_file failed.");
     }
     else
     {
         if (port == 0)
         {
-            if (websocket)
+            if (connectionProtocol == ConnectionProtocol::AcmeOnly)
+                port = 80;
+            else if (connectionProtocol == ConnectionProtocol::WebsocketMqtt)
                 port = 8080;
             else
                 port = 1883;
         }
+
+        if (dropOnAbsentCertificates)
+        {
+            throw ConfigFileException("Using drop_on_absent_certificate is only valid on SSL listeners; define privkey and fullchain.");
+        }
+    }
+
+    if (protocol < ListenerProtocol::Unix && !unixSocketPath.empty())
+    {
+        throw ConfigFileException("Specifying 'unix_socket_path' for IP listeners is not allowed.");
+    }
+
+    if (protocol == ListenerProtocol::Unix)
+    {
+        if (unixSocketPath.empty())
+            throw ConfigFileException("Option 'unix_socket_path' must be set for unix socket listeners.");
+
+        if (!inet4BindAddress.empty() || !inet6BindAddress.empty())
+            throw ConfigFileException("Specifying inet bind addresses is not allowed for unix socket listeners.");
+
+        if (isSsl())
+            throw ConfigFileException("TLS on domain sockets is not supported.");
+
+        if (acmeRedirectURL)
+            throw ConfigFileException("ACME redirect is not support on unix sockets");
     }
 
     if ((!clientVerificationCaDir.empty() || !clientVerificationCaFile.empty()) && !isSsl())
@@ -50,6 +89,11 @@ void Listener::isValid()
     if (port <= 0 || port > 65534)
     {
         throw ConfigFileException(formatString("Port nr %d is not valid", port));
+    }
+
+    if (connectionProtocol == ConnectionProtocol::AcmeOnly && !acmeRedirectURL)
+    {
+        throw ConfigFileException("An ACME listener needs to have an acme_redirect_url");
     }
 }
 
@@ -70,19 +114,33 @@ bool Listener::isHaProxy() const
 
 std::string Listener::getProtocolName() const
 {
-    if (isSsl())
+    if (protocol == ListenerProtocol::Unix)
     {
-        if (websocket)
+        return "unix socket";
+    }
+    if (connectionProtocol == ConnectionProtocol::AcmeOnly)
+    {
+        return "ACME-only";
+    }
+    else if (isSsl())
+    {
+        if (connectionProtocol == ConnectionProtocol::WebsocketMqtt)
             return "SSL websocket";
         else
             return "SSL TCP";
     }
     else
     {
-        if (websocket)
-            return "non-SSL websocket";
+        std::string answer;
+
+        if (connectionProtocol == ConnectionProtocol::WebsocketMqtt)
+            answer = "non-SSL websocket";
         else
-            return "non-SSL TCP";
+            answer = "non-SSL TCP";
+
+        if (acmeRedirectURL)
+            answer.append(" with ACME redirect to ").append(acmeRedirectURL.value());
+        return answer;
     }
 
     return "whoops";
@@ -141,6 +199,14 @@ X509ClientVerification Listener::getX509ClientVerficationMode() const
     return result;
 }
 
+bool Listener::dropListener() const
+{
+    if (!dropOnAbsentCertificates || !isSsl())
+        return false;
+
+    return access(sslPrivkey.c_str(), R_OK) != 0 && access(sslFullchain.c_str(), R_OK) != 0;
+}
+
 std::string Listener::getBindAddress(ListenerProtocol p)
 {
     if (p == ListenerProtocol::IPv4)
@@ -155,5 +221,29 @@ std::string Listener::getBindAddress(ListenerProtocol p)
             return "::";
         return inet6BindAddress;
     }
+    if (p == ListenerProtocol::Unix)
+    {
+        if (unixSocketPath.empty())
+            throw std::runtime_error("Listener's unix socket path is empty.");
+        return unixSocketPath;
+    }
     return "";
 }
+
+bool Listener::isAllowed(const sockaddr *addr) const
+{
+    if (!denyList.empty() && std::any_of(denyList.begin(), denyList.end(), [=](const Network &n) { return n.match(addr);}))
+        return false;
+
+    if (exclusiveAllowList.empty())
+        return true;
+
+    return std::any_of(exclusiveAllowList.begin(), exclusiveAllowList.end(), [=](const Network &n) { return n.match(addr);});
+}
+
+
+
+
+
+
+

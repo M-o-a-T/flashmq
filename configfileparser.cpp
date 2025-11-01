@@ -16,6 +16,8 @@ See LICENSE for license details.
 #include <fstream>
 #include <regex>
 #include <sys/stat.h>
+#include <optional>
+#include <sys/sysinfo.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -23,6 +25,7 @@ See LICENSE for license details.
 #include "exceptions.h"
 #include "utils.h"
 #include "globber.h"
+#include "globals.h"
 
 /**
  * @brief Like std::stoi, but demands that the entire value is consumed
@@ -47,10 +50,10 @@ int full_stoi(const std::string &key, const std::string &value)
  * @param value the string to parse
  * @return the parsed unsigned long
  **/
-unsigned long full_stoul(const std::string &key, const std::string &value)
+unsigned long full_stoul(const std::string &key, const std::string &value, int base=10)
 {
     size_t ptr;
-    unsigned long newVal = std::stoul(value, &ptr);
+    unsigned long newVal = std::stoul(value, &ptr, base);
     if (ptr != value.length())
     {
         throw ConfigFileException(formatString("%s's value of '%s' can't be parsed to a number", key.c_str(), value.c_str()));
@@ -197,6 +200,8 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validKeys.insert("allow_unsafe_username_chars");
     validKeys.insert("client_initial_buffer_size");
     validKeys.insert("max_packet_size");
+    validKeys.insert("max_qos");
+    validKeys.insert("mqtt3_qos_exceed_action");
     validKeys.insert("log_debug");
     validKeys.insert("log_subscriptions");
     validKeys.insert("log_level");
@@ -241,6 +246,10 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validListenKeys.insert("inet_protocol");
     validListenKeys.insert("inet4_bind_address");
     validListenKeys.insert("inet6_bind_address");
+    validListenKeys.insert("unix_socket_path");
+    validListenKeys.insert("unix_socket_user");
+    validListenKeys.insert("unix_socket_group");
+    validListenKeys.insert("unix_socket_mode");
     validListenKeys.insert("haproxy");
     validListenKeys.insert("client_verification_ca_file");
     validListenKeys.insert("client_verification_ca_dir");
@@ -249,6 +258,13 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validListenKeys.insert("tcp_nodelay");
     validListenKeys.insert("minimum_tls_version");
     validListenKeys.insert("overload_mode");
+    validListenKeys.insert("acme_redirect_url");
+    validListenKeys.insert("drop_on_absent_certificate");
+    validListenKeys.insert("max_buffer_size");
+    validListenKeys.insert("max_qos");
+    validListenKeys.insert("mqtt3_qos_exceed_action");
+    validListenKeys.insert("only_allow_from");
+    validListenKeys.insert("deny_from");
 
     validBridgeKeys.insert("local_username");
     validBridgeKeys.insert("remote_username");
@@ -279,6 +295,8 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validBridgeKeys.insert("local_prefix");
     validBridgeKeys.insert("remote_prefix");
     validBridgeKeys.insert("minimum_tls_version");
+    validBridgeKeys.insert("connection_count");
+    validBridgeKeys.insert("max_buffer_size");
 }
 
 std::list<std::string> ConfigFileParser::readFileRecursively(const std::string &path) const
@@ -403,7 +421,8 @@ void ConfigFileParser::loadFile(bool test)
 
     ConfigParseLevel curParseLevel = ConfigParseLevel::Root;
     std::shared_ptr<Listener> curListener;
-    std::shared_ptr<BridgeConfig> curBridge;
+    std::optional<BridgeConfig> curBridge;
+    std::list<BridgeConfig> preMultipliedBridges;
     Settings tmpSettings;
 
     const std::set<std::string> blockNames {"listen", "bridge"};
@@ -424,7 +443,7 @@ void ConfigFileParser::loadFile(bool test)
             else if (testKeyValidity(key, "bridge", blockNames))
             {
                 curParseLevel = ConfigParseLevel::Bridge;
-                curBridge = std::make_unique<BridgeConfig>();
+                curBridge = std::make_optional<BridgeConfig>();
             }
             else
             {
@@ -448,14 +467,26 @@ void ConfigFileParser::loadFile(bool test)
             if (curParseLevel == ConfigParseLevel::Listen)
             {
                 curListener->isValid();
-                tmpSettings.listeners.push_back(curListener);
+
+                if (curListener->dropListener())
+                {
+                    if (test)
+                    {
+                        Logger::getInstance()->log(LOG_NOTICE)
+                            << "Approved missing certificates: dropping " << curListener->getProtocolName()
+                            << " listener, port " << curListener->port;
+                    }
+                }
+                else
+                {
+                    tmpSettings.listeners.push_back(curListener);
+                }
                 curListener.reset();
             }
             else if (curParseLevel == ConfigParseLevel::Bridge)
             {
                 curBridge->isValid();
-
-                tmpSettings.bridges.push_back(std::move(curBridge));
+                preMultipliedBridges.push_back(std::move(curBridge.value()));
             }
 
             curParseLevel = ConfigParseLevel::Root;
@@ -478,9 +509,15 @@ void ConfigFileParser::loadFile(bool test)
             {
                 if (testKeyValidity(key, "protocol", validListenKeys))
                 {
-                    if (value != "mqtt" && value != "websockets")
+                    if (value != "mqtt" && value != "websockets" && value != "acme")
                         throw ConfigFileException(formatString("Protocol '%s' is not a valid listener protocol", value.c_str()));
-                    curListener->websocket = value == "websockets";
+
+                    if (value == "mqtt")
+                        curListener->connectionProtocol = ConnectionProtocol::Mqtt;
+                    else if (value == "websockets")
+                        curListener->connectionProtocol = ConnectionProtocol::WebsocketMqtt;
+                    else if (value == "acme")
+                        curListener->connectionProtocol = ConnectionProtocol::AcmeOnly;
                 }
                 else if (testKeyValidity(key, "port", validListenKeys))
                 {
@@ -488,12 +525,10 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 else if (testKeyValidity(key, "fullchain", validListenKeys))
                 {
-                    checkFileExistsAndReadable("SSL fullchain", value, 1024*1024);
                     curListener->sslFullchain = value;
                 }
                 if (testKeyValidity(key, "privkey", validListenKeys))
                 {
-                    checkFileExistsAndReadable("SSL privkey", value, 1024*1024);
                     curListener->sslPrivkey = value;
                 }
                 if (testKeyValidity(key, "inet_protocol", validListenKeys))
@@ -504,6 +539,8 @@ void ConfigFileParser::loadFile(bool test)
                         curListener->protocol = ListenerProtocol::IPv6;
                     else if (value == "ip4_ip6")
                         curListener->protocol = ListenerProtocol::IPv46;
+                    else if (value == "unix")
+                        curListener->protocol = ListenerProtocol::Unix;
                     else
                         throw ConfigFileException(formatString("Invalid inet protocol: %s", value.c_str()));
                 }
@@ -514,6 +551,28 @@ void ConfigFileParser::loadFile(bool test)
                 if (testKeyValidity(key, "inet6_bind_address", validListenKeys))
                 {
                     curListener->inet6BindAddress = value;
+                }
+                if (testKeyValidity(key, "unix_socket_path", validListenKeys))
+                {
+                    curListener->unixSocketPath = value;
+                }
+                if (testKeyValidity(key, "unix_socket_user", validListenKeys))
+                {
+                    /*
+                     * We're not verifying the existence of the user. This would make it non-deterministic between
+                     * environments, and perhaps users want to already have the config ready before the users are
+                     * present on the system.
+                     */
+                    curListener->unixSocketUser = valueTrimmed;
+                }
+                if (testKeyValidity(key, "unix_socket_group", validListenKeys))
+                {
+                    // See comment above about not checking the the presence of the group.
+                    curListener->unixSocketGroup = valueTrimmed;
+                }
+                if (testKeyValidity(key, "unix_socket_mode", validListenKeys))
+                {
+                    curListener->unixSocketMode = full_stoul(key, value, 8);
                 }
                 if (testKeyValidity(key, "haproxy", validListenKeys))
                 {
@@ -566,6 +625,57 @@ void ConfigFileParser::loadFile(bool test)
                         curListener->overloadMode = OverloadMode::CloseNewClients;
                     else
                         throw ConfigFileException(formatString("Value '%s' for '%s' is invalid.", value.c_str(), key.c_str()));
+                }
+                if (testKeyValidity(key, "acme_redirect_url", validListenKeys))
+                {
+                    curListener->acmeRedirectURL = valueTrimmed;
+                }
+                if (testKeyValidity(key, "drop_on_absent_certificate", validListenKeys))
+                {
+                    curListener->dropOnAbsentCertificates = stringTruthiness(value);
+                }
+                if (testKeyValidity(key, "max_buffer_size", validListenKeys))
+                {
+                    size_t val = full_stoul(key, valueTrimmed);
+
+                    if (val > 1073741824)
+                        throw ConfigFileException("Bridge's " + key + " cannot be bigger than 1 GB");
+
+                    curListener->maxBufferSize = val;
+                }
+                if (testKeyValidity(key, "max_qos", validListenKeys))
+                {
+                    const int qos = full_stoi(key, value);
+                    if (qos < 0 || qos > 2)
+                    {
+                        std::ostringstream oss;
+                        oss << "Value " << qos << " for " << key << " is invalid.";
+                        throw ConfigFileException(oss.str());
+                    }
+                    curListener->maxQos = qos;
+                }
+                if (testKeyValidity(key, "mqtt3_qos_exceed_action", validListenKeys))
+                {
+                    if (valueTrimmed == "disconnect")
+                        curListener->mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
+                    else if (valueTrimmed == "drop")
+                        curListener->mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Drop;
+                    else
+                    {
+                        std::ostringstream oss;
+                        oss << "Value '" << valueTrimmed << "' for " << key << " is invalid.";
+                        throw ConfigFileException(oss.str());
+                    }
+                }
+                if (testKeyValidity(key, "only_allow_from", validListenKeys))
+                {
+                    Network net(valueTrimmed);
+                    curListener->exclusiveAllowList.push_back(net);
+                }
+                if (testKeyValidity(key, "deny_from", validListenKeys))
+                {
+                    Network net(valueTrimmed);
+                    curListener->denyList.push_back(net);
                 }
 
                 testCorrectNumberOfValues(key, number_of_expected_values, values);
@@ -817,6 +927,24 @@ void ConfigFileParser::loadFile(bool test)
                     else
                         throw ConfigFileException("Value '" + valueTrimmed + "' is not a valid value for " + key);
                 }
+                if (testKeyValidity(key, "connection_count", validBridgeKeys))
+                {
+                    if (valueTrimmed == "auto")
+                    {
+                        curBridge->connection_count = get_nprocs();
+                    }
+                    else
+                        curBridge->connection_count = full_stoul(key, valueTrimmed);
+                }
+                if (testKeyValidity(key, "max_buffer_size", validBridgeKeys))
+                {
+                    size_t val = full_stoul(key, valueTrimmed);
+
+                    if (val > 1073741824)
+                        throw ConfigFileException("Bridge's " + key + " cannot be bigger than 1 GB");
+
+                    curBridge->maxBufferSize = val;
+                }
 
                 testCorrectNumberOfValues(key, number_of_expected_values, values);
                 continue;
@@ -893,6 +1021,32 @@ void ConfigFileParser::loadFile(bool test)
                         throw ConfigFileException(oss.str());
                     }
                     tmpSettings.maxPacketSize = newVal;
+                }
+
+                if (testKeyValidity(key, "max_qos", validKeys))
+                {
+                    const int qos = full_stoi(key, value);
+                    if (qos < 0 || qos > 2)
+                    {
+                        std::ostringstream oss;
+                        oss << "Value " << qos << " for " << key << " is invalid.";
+                        throw ConfigFileException(oss.str());
+                    }
+                    tmpSettings.maxQos = qos;
+                }
+
+                if (testKeyValidity(key, "mqtt3_qos_exceed_action", validKeys))
+                {
+                    if (valueTrimmed == "disconnect")
+                        tmpSettings.mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
+                    else if (valueTrimmed == "drop")
+                        tmpSettings.mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Drop;
+                    else
+                    {
+                        std::ostringstream oss;
+                        oss << "Value '" << valueTrimmed << "' for " << key << " is invalid.";
+                        throw ConfigFileException(oss.str());
+                    }
                 }
 
                 if (testKeyValidity(key, "log_debug", validKeys))
@@ -1241,12 +1395,28 @@ void ConfigFileParser::loadFile(bool test)
         testCorrectNumberOfValues(key, number_of_expected_values, values);
     }
 
-    tmpSettings.checkUniqueBridgeNames();
+    checkUniqueBridgeNames(preMultipliedBridges);
+
+    const std::string share_name_path = tmpSettings.getGeneratedShareNamesFilePath();
+    globals->bridgeClientGroupIds.loadShareNames(share_name_path, !test);
+
+    for (const BridgeConfig &bc : preMultipliedBridges)
+    {
+        std::vector<BridgeConfig> many = bc.multiply();
+
+        for (BridgeConfig &b : many)
+        {
+            tmpSettings.bridges.push_back(std::move(b));
+        }
+    }
+
     tmpSettings.authOptCompatWrap = AuthOptCompatWrap(pluginOpts);
     tmpSettings.flashmqpluginOpts = std::move(pluginOpts);
 
     if (!test)
     {
+        globals->bridgeClientGroupIds.saveShareNames(share_name_path);
+
         this->settings = tmpSettings;
     }
 }

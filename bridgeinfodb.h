@@ -8,16 +8,18 @@
 
 
 #define MAGIC_STRING_BRIDGEINFO_FILE_V1 "BridgeInfoDbV1"
+#define MAGIC_STRING_BRIDGEINFO_FILE_V2 "BridgeInfoDbV2"
 
 struct BridgeInfoForSerializing
 {
     std::string prefix;
     std::string clientId;
+    std::string client_group_share_name;
 
     BridgeInfoForSerializing() = default;
-    BridgeInfoForSerializing(const std::shared_ptr<BridgeConfig> bridge);
+    BridgeInfoForSerializing(const BridgeConfig &bridge);
 
-    static std::list<BridgeInfoForSerializing> getBridgeInfosForSerializing(const std::unordered_map<std::string, std::shared_ptr<BridgeConfig>> &input);
+    static std::list<BridgeInfoForSerializing> getBridgeInfosForSerializing(const std::unordered_map<std::string, BridgeConfig> &input);
 };
 
 class BridgeInfoDb : private PersistenceFile
@@ -26,6 +28,7 @@ class BridgeInfoDb : private PersistenceFile
     {
         unknown,
         v1,
+        v2
     };
 
     ReadVersion readVersion = ReadVersion::unknown;

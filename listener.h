@@ -14,15 +14,18 @@ See LICENSE for license details.
 #include <string>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "sslctxmanager.h"
 #include "enums.h"
+#include "network.h"
 
 enum class ListenerProtocol
 {
     IPv46,
     IPv4,
-    IPv6
+    IPv6,
+    Unix
 };
 
 struct Listener
@@ -36,8 +39,12 @@ struct Listener
     ListenerProtocol protocol = ListenerProtocol::IPv46;
     std::string inet4BindAddress;
     std::string inet6BindAddress;
+    std::string unixSocketPath;
+    std::optional<std::string> unixSocketUser;
+    std::optional<std::string> unixSocketGroup;
+    std::optional<mode_t> unixSocketMode;
     int port = 0;
-    bool websocket = false;
+    ConnectionProtocol connectionProtocol = ConnectionProtocol::Mqtt;
     bool tcpNoDelay = false;
     bool haproxy = false;
     std::string sslFullchain;
@@ -47,8 +54,15 @@ struct Listener
     bool clientVerifictionStillDoAuthn = false;
     std::unique_ptr<SslCtxManager> sslctx;
     AllowListenerAnonymous allowAnonymous = AllowListenerAnonymous::None;
+    std::optional<std::string> acmeRedirectURL;
     TLSVersion minimumTlsVersion = TLSVersion::TLSv1_1;
     std::optional<OverloadMode> overloadMode;
+    bool dropOnAbsentCertificates = false;
+    std::optional<uint32_t> maxBufferSize;
+    std::vector<Network> exclusiveAllowList;
+    std::vector<Network> denyList;
+    std::optional<uint8_t> maxQos;
+    std::optional<Mqtt3QoSExceedAction> mqtt3QoSExceedAction;
 
     void isValid();
     bool isSsl() const;
@@ -57,7 +71,9 @@ struct Listener
     std::string getProtocolName() const;
     void loadCertAndKeyFromConfig();
     X509ClientVerification getX509ClientVerficationMode() const;
+    bool dropListener() const;
 
     std::string getBindAddress(ListenerProtocol p);
+    bool isAllowed(const sockaddr *addr) const;
 };
 #endif // LISTENER_H

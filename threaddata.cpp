@@ -17,6 +17,7 @@ See LICENSE for license details.
 #include "subscriptionstore.h"
 #include "mainapp.h"
 #include "utils.h"
+#include "threadloop.h"
 
 KeepAliveCheck::KeepAliveCheck(const std::shared_ptr<Client> client) :
     client(client)
@@ -32,7 +33,7 @@ QueuedRetainedMessage::QueuedRetainedMessage(const Publish &p, const std::vector
 
 }
 
-ThreadData::ThreadData(int threadnr, const Settings &settings, const PluginLoader &pluginLoader) :
+ThreadData::ThreadData(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader) :
     epollfd(check<std::runtime_error>(epoll_create(999))),
     pluginLoader(pluginLoader),
     settingsLocalCopy(settings),
@@ -73,35 +74,6 @@ ThreadData::~ThreadData()
         disconnectingAllEventFd = -1;
     }
 
-}
-
-void ThreadData::start(thread_f f)
-{
-    this->thread = std::thread(f, this);
-
-    pthread_t native = this->thread.native_handle();
-    std::ostringstream threadName;
-    threadName << "FlashMQ T " << threadnr;
-    threadName.flush();
-    std::string name = threadName.str();
-    const char *c_str = name.c_str();
-    pthread_setname_np(native, c_str);
-
-    /*
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(threadnr, &cpuset);
-    check<std::runtime_error>(pthread_setaffinity_np(native, sizeof(cpuset), &cpuset));
-
-    // It's not really necessary to get affinity again, but now I'm logging truth instead assumption.
-    check<std::runtime_error>(pthread_getaffinity_np(native, sizeof(cpuset), &cpuset));
-    int pinned_cpu = -1;
-    for (int j = 0; j < CPU_SETSIZE; j++)
-        if (CPU_ISSET(j, &cpuset))
-            pinned_cpu = j;
-
-    logger->logf(LOG_NOTICE, "Thread '%s' pinned to CPU %d", c_str, pinned_cpu);
-    */
 }
 
 void ThreadData::quit()
@@ -147,7 +119,7 @@ void ThreadData::queueRemoveExpiredSessions()
 
 void ThreadData::queuePurgeSubscriptionTree()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
     if (subscriptionStore->hasDeferredSubscriptionTreeNodesForPurging())
         return;
 
@@ -161,7 +133,7 @@ void ThreadData::queuePurgeSubscriptionTree()
 
 void ThreadData::queueRemoveExpiredRetainedMessages()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
     if (subscriptionStore->hasDeferredRetainedMessageNodesForPurging())
         return;
 
@@ -206,9 +178,9 @@ void ThreadData::queueClientNextKeepAliveCheck(std::shared_ptr<Client> &client, 
  */
 void ThreadData::continuationOfAuthentication(std::shared_ptr<Client> &client, AuthResult authResult, const std::string &authMethod, const std::string &returnData)
 {
-    assert(pthread_self() == thread.native_handle());
+    assert(pthread_self() == thread_id);
 
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
 
     if (authResult == AuthResult::auth_continue)
     {
@@ -319,7 +291,7 @@ void ThreadData::bridgeReconnect()
                     continue;
                 }
 
-                const std::list<FMQSockaddr_in6> &results = bridge->dns.getResult();
+                const std::list<FMQSockaddr> &results = bridge->dns.getResult();
 
                 // If empty, we're still waiting for the result but there is no error.
                 if (results.empty())
@@ -331,7 +303,7 @@ void ThreadData::bridgeReconnect()
                 bridge->dnsResults = results;
             }
 
-            FMQSockaddr_in6 addr = bridge->popDnsResult();
+            FMQSockaddr addr = bridge->popDnsResult();
 
             bridge->registerReconnect();
 
@@ -339,23 +311,25 @@ void ThreadData::bridgeReconnect()
             int flags = fcntl(sockfd, F_GETFL);
             fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
-            SSL *clientSSL = nullptr;
+            FmqSsl clientSSL;
             if (bridge->c.tlsMode > BridgeTLSMode::None)
             {
-                clientSSL = SSL_new(bridge->sslctx->get());
+                clientSSL = FmqSsl(*bridge->sslctx);
 
-                if (clientSSL == NULL)
+                if (!clientSSL)
                 {
                     logger->logf(LOG_ERR, "Problem creating SSL object for bridge. Closing client.");
                     close(sockfd);
                     continue;
                 }
 
-                SSL_set_fd(clientSSL, sockfd);
+                clientSSL.set_fd(sockfd);
             }
 
-            std::shared_ptr<Client> c(new Client(sockfd, _threadData, clientSSL, false, false, nullptr, settingsLocalCopy));
+            std::shared_ptr<Client> c(new Client(ClientType::LocalBridge, sockfd, _threadData, std::move(clientSSL), ConnectionProtocol::Mqtt, false, addr.getSockaddr(), settingsLocalCopy));
             c->setBridgeState(bridge);
+            if (bridge->c.maxBufferSize)
+                c->setMaxBufSizeOverride(bridge->c.maxBufferSize.value());
 
             logger->logf(LOG_NOTICE, "Connecting brige: %s", c->repr().c_str());
 
@@ -376,7 +350,7 @@ void ThreadData::bridgeReconnect()
             }
             else
             {
-                std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
+                std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
                 session = subscriptionStore->getBridgeSession(c);
                 bridge->session = session;
             }
@@ -426,7 +400,7 @@ void ThreadData::clientDisconnectActions(
         bool authenticated, const std::string &clientid, std::shared_ptr<WillPublish> &willPublish, std::shared_ptr<Session> &session,
         std::weak_ptr<BridgeState> &bridgeState, const std::string &disconnect_reason)
 {
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
 
     assert(store);
 
@@ -540,10 +514,8 @@ void ThreadData::publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadDat
         publishStat("$SYS/broker/threads/" + std::to_string(thread->threadnr) + "/retained_deferrals/timeout/persecond", thread->deferredRetainedMessagesSetTimeout.getPerSecond());
     }
 
-    GlobalStats *globalStats = GlobalStats::getInstance();
-
-    publishStat("$SYS/broker/network/socketconnects/total", globalStats->socketConnects.get());
-    publishStat("$SYS/broker/network/socketconnects/persecond", globalStats->socketConnects.getPerSecond());
+    publishStat("$SYS/broker/network/socketconnects/total", globals->stats.socketConnects.get());
+    publishStat("$SYS/broker/network/socketconnects/persecond", globals->stats.socketConnects.getPerSecond());
 
     publishStat("$SYS/broker/clients/mqttconnects/total", mqttConnectCount);
     publishStat("$SYS/broker/clients/mqttconnects/persecond", mqttConnectCountPerSecond);
@@ -571,7 +543,7 @@ void ThreadData::publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadDat
     publishStat("$SYS/broker/load/aclchecks/registerwill/total", aclRegisterWillCheckCount);
     publishStat("$SYS/broker/load/aclchecks/registerwill/persecond", aclRegisterWillChecksPerSecond);
 
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
 
     publishStat("$SYS/broker/retained messages/count", subscriptionStore->getRetainedMessageCount());
 
@@ -579,7 +551,7 @@ void ThreadData::publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadDat
 
     publishStat("$SYS/broker/subscriptions/count", subscriptionStore->getSubscriptionCount());
 
-    for (auto &pair : globalStats->getExtras())
+    for (auto &pair : globals->stats.getExtras())
     {
         Publish p(pair.first, pair.second, 0);
         publishWithAcl(p);
@@ -598,8 +570,6 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
     if (!bridge)
         return;
 
-    GlobalStats *globalStats = GlobalStats::getInstance();
-
     {
         const std::string payload = connected ? "1" : "0";
 
@@ -607,7 +577,7 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
         ss << "$SYS/broker/bridge/" << bridge->c.clientidPrefix << "/connected";
         const std::string topic = ss.str();
 
-        globalStats->setExtra(topic, payload);
+        globals->stats.setExtra(topic, payload);
 
         Publish p(topic, payload, 0);
         publishWithAcl(p, true);
@@ -618,7 +588,7 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
         const std::string message = error.value_or(message_on_no_error);
         const std::string topic = "$SYS/broker/bridge/" + bridge->c.clientidPrefix + "/connection_status";
 
-        globalStats->setExtra(topic, message);
+        globals->stats.setExtra(topic, message);
         Publish p(topic, message, 0);
         publishWithAcl(p, true);
     }
@@ -626,7 +596,7 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
 
 void ThreadData::queueSettingRetainedMessage(const Publish &p, const std::vector<std::string> &subtopics, const std::chrono::time_point<std::chrono::steady_clock> limit)
 {
-    assert(pthread_self() == thread.native_handle());
+    assert(pthread_self() == thread_id);
     const bool wakeup_required = this->queuedRetainedMessages.empty();
     this->queuedRetainedMessages.emplace_front(p, subtopics, limit);
     this->deferredRetainedMessagesSet.inc(1);
@@ -640,8 +610,8 @@ void ThreadData::publishWithAcl(Publish &pub, bool setRetain)
     authentication.aclCheck(pub, pub.payload, AclAccess::write);
 
     PublishCopyFactory factory(&pub);
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
-    subscriptionStore->queuePacketAtSubscribers(factory, "", true);
+    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
+    subscriptionStore->queuePacketAtSubscribers(factory, "", {}, true);
 
     if (setRetain)
         subscriptionStore->setRetainedMessage(pub, factory.getSubtopics());
@@ -653,8 +623,7 @@ void ThreadData::publishWithAcl(Publish &pub, bool setRetain)
  */
 void ThreadData::sendQueuedWills()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
-    subscriptionStore->sendQueuedWillMessages();
+    globals->subscriptionStore->sendQueuedWillMessages();
 }
 
 /**
@@ -663,14 +632,12 @@ void ThreadData::sendQueuedWills()
  */
 void ThreadData::removeExpiredSessions()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
-    subscriptionStore->removeExpiredSessionsClients();
+    globals->subscriptionStore->removeExpiredSessionsClients();
 }
 
 void ThreadData::purgeSubscriptionTree()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
-    bool done = subscriptionStore->purgeSubscriptionTree();
+    bool done = globals->subscriptionStore->purgeSubscriptionTree();
 
     if (!done)
     {
@@ -685,8 +652,7 @@ void ThreadData::purgeSubscriptionTree()
  */
 void ThreadData::removeExpiredRetainedMessages()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = MainApp::getMainApp()->getSubscriptionStore();
-    bool done = subscriptionStore->expireRetainedMessages();
+    bool done = globals->subscriptionStore->expireRetainedMessages();
 
     if (!done)
     {
@@ -827,7 +793,7 @@ void ThreadData::giveBridge(std::shared_ptr<BridgeState> &bridgeState)
     }
 }
 
-void ThreadData::removeBridgeQueued(std::shared_ptr<BridgeConfig> bridgeConfig, const std::string &reason)
+void ThreadData::removeBridgeQueued(const BridgeConfig &bridgeConfig, const std::string &reason)
 {
     auto f = std::bind(&ThreadData::removeBridge, this, bridgeConfig, reason);
     auto task_queue_locked = taskQueue.lock();
@@ -835,14 +801,11 @@ void ThreadData::removeBridgeQueued(std::shared_ptr<BridgeConfig> bridgeConfig, 
     wakeUpThread();
 }
 
-void ThreadData::removeBridge(std::shared_ptr<BridgeConfig> bridgeConfig, const std::string &reason)
+void ThreadData::removeBridge(const BridgeConfig &bridgeConfig, const std::string &reason)
 {
-    if (!bridgeConfig)
-        return;
-
     auto clients_locked = clients.lock();
 
-    auto pos = clients_locked->bridges.find(bridgeConfig->clientidPrefix);
+    auto pos = clients_locked->bridges.find(bridgeConfig.clientidPrefix);
 
     if (pos == clients_locked->bridges.end())
         return;
@@ -875,7 +838,7 @@ void ThreadData::setQueuedRetainedMessages()
     if (this->queuedRetainedMessages.empty())
         return;
 
-    std::shared_ptr<SubscriptionStore> store = MainApp::getMainApp()->getSubscriptionStore();
+    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
 
     if (!store)
         return;
@@ -950,7 +913,7 @@ void ThreadData::removeClientQueued(const std::shared_ptr<Client> &client)
 {
     // This is for same-thread calling, to avoid the calling thread to be slower and ending up with
     // the last reference on the shared pointer to client.
-    assert(pthread_self() == thread.native_handle());
+    assert(pthread_self() == thread_id);
 
     bool wakeUpNeeded = true;
 
@@ -1006,7 +969,7 @@ void ThreadData::removeClientQueued(int fd)
 void ThreadData::removeClient(std::shared_ptr<Client> client)
 {
     // This function is only for same-thread calling.
-    assert(pthread_self() == thread.native_handle());
+    assert(pthread_self() == thread_id);
 
     if (!client)
         return;
@@ -1082,11 +1045,6 @@ void ThreadData::queueQuit()
     authentication.setQuitting();
 
     wakeUpThread();
-}
-
-void ThreadData::waitForQuit()
-{
-    thread.join();
 }
 
 void ThreadData::queuePasswdFileReload()
@@ -1289,7 +1247,7 @@ void ThreadData::initplugin()
 {
     authentication.loadMosquittoPasswordFile();
     authentication.loadMosquittoAclFile();
-    authentication.loadPlugin(pluginLoader);
+    authentication.loadPlugin(*pluginLoader);
     authentication.init();
     authentication.securityInit(false);
 }
@@ -1348,6 +1306,43 @@ void ThreadData::wakeUpThread()
 }
 
 
+ThreadDataOwner::ThreadDataOwner(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader) :
+    td(std::make_shared<ThreadData>(threadnr, settings, pluginLoader))
+{
 
+}
 
+ThreadDataOwner::~ThreadDataOwner()
+{
+    waitForQuit();
+}
 
+void ThreadDataOwner::start()
+{
+    this->thread = std::thread(&do_thread_work, td);
+
+    pthread_t native = this->thread.native_handle();
+    td->thread_id = native;
+    std::ostringstream threadName;
+    threadName << "FlashMQ T " << td->threadnr;
+    threadName.flush();
+    std::string name = threadName.str();
+    const char *c_str = name.c_str();
+    pthread_setname_np(native, c_str);
+}
+
+void ThreadDataOwner::waitForQuit()
+{
+    if (thread.joinable())
+        thread.join();
+}
+
+ThreadData *ThreadDataOwner::operator->() const
+{
+    return td.get();
+}
+
+std::shared_ptr<ThreadData> ThreadDataOwner::getThreadData() const
+{
+    return td;
+}

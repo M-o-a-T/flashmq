@@ -49,6 +49,8 @@ enum class WildcardSubscriptionDenyMode
     DenyRetainedOnly
 };
 
+void checkUniqueBridgeNames(const std::list<BridgeConfig> &bridges);
+
 class Settings
 {
     friend class ConfigFileParser;
@@ -56,9 +58,7 @@ class Settings
     AuthOptCompatWrap authOptCompatWrap;
     std::unordered_map<std::string, std::string> flashmqpluginOpts;
 
-    std::list<std::shared_ptr<BridgeConfig>> bridges;
-
-    void checkUniqueBridgeNames() const;
+    std::list<BridgeConfig> bridges;
 
 public:
     // Actual config options with their defaults.
@@ -76,6 +76,8 @@ public:
     uint32_t clientMaxWriteBufferSize = 1048576;
     uint16_t maxIncomingTopicAliasValue = 65535;
     uint16_t maxOutgoingTopicAliasValue = 65535;
+    uint8_t maxQos = 2;
+    Mqtt3QoSExceedAction mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
 #ifdef TESTING
     std::optional<bool> logDebug;
     LogLevel logLevel = LogLevel::Debug;
@@ -119,6 +121,7 @@ public:
     std::string getRetainedMessagesDBFile() const;
     std::string getSessionsDBFile() const;
     std::string getBridgeNamesDBFile() const;
+    std::string getGeneratedShareNamesFilePath() const;
 
     uint32_t getExpireSessionAfterSeconds() const;
 
@@ -126,7 +129,7 @@ public:
     bool matchAddrWithSetRealIpFrom(const struct sockaddr_in6 *addr) const;
     bool matchAddrWithSetRealIpFrom(const struct sockaddr_in *addr) const;
 
-    std::list<std::shared_ptr<BridgeConfig>> stealBridges();
+    std::list<BridgeConfig> stealBridges();
 };
 
 #endif // SETTINGS_H

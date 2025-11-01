@@ -14,7 +14,8 @@ See LICENSE for license details.
 #include <string.h>
 #include <openssl/x509v3.h>
 #include <openssl/sslerr.h>
-#include <signal.h>
+#include <array>
+#include <optional>
 
 #include "logger.h"
 #include "client.h"
@@ -22,6 +23,7 @@ See LICENSE for license details.
 #include "exceptions.h"
 #include "threadglobals.h"
 #include "settings.h"
+#include "http.h"
 
 IncompleteSslWrite::IncompleteSslWrite(size_t nbytes) :
     valid(true),
@@ -64,32 +66,14 @@ IncompleteWebsocketRead::IncompleteWebsocketRead()
     reset();
 }
 
-IoWrapper::IoWrapper(SSL *ssl, bool websocket, const size_t initialBufferSize, Client *parent) :
+IoWrapper::IoWrapper(FmqSsl &&ssl, ConnectionProtocol connectionProtocol, const size_t initialBufferSize, Client *parent) :
     parentClient(parent),
-    ssl(ssl),
-    websocket(websocket),
-    websocketPendingBytes(websocket ? initialBufferSize : 0),
-    websocketWriteRemainder(websocket ? initialBufferSize : 0)
+    ssl(std::move(ssl)),
+    connectionProtocol(connectionProtocol),
+    websocketPendingBytes(connectionProtocol == ConnectionProtocol::WebsocketMqtt ? initialBufferSize : 0),
+    websocketWriteRemainder(connectionProtocol == ConnectionProtocol::WebsocketMqtt ? initialBufferSize : 0)
 {
 
-}
-
-IoWrapper::~IoWrapper()
-{
-    if (ssl)
-    {
-        /*
-         * We write the shutdown when we can, but don't take error conditions into account. If socket buffers are full, because
-         * clients disappear for instance, the socket is just closed. We don't care.
-         *
-         * Truncation attacks seem irrelevant. MQTT is frame based, so either end knows if the transmission is done or not. The
-         * close_notify is not used in determining whether to use or discard the received data.
-         */
-        SSL_shutdown(ssl);
-
-        SSL_free(ssl);
-        ssl = nullptr;
-    }
 }
 
 void IoWrapper::startOrContinueSslHandshake()
@@ -104,11 +88,10 @@ void IoWrapper::startOrContinueSslConnect()
 {
     assert(ssl);
     ERR_clear_error();
-    char sslErrorBuf[OPENSSL_ERROR_STRING_SIZE];
-    int connected = SSL_connect(ssl);
+    int connected = SSL_connect(ssl.get());
     if (connected <= 0)
     {
-        int err = SSL_get_error(ssl, connected);
+        int err = SSL_get_error(ssl.get(), connected);
 
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         {
@@ -117,9 +100,9 @@ void IoWrapper::startOrContinueSslConnect()
         }
 
         unsigned long error_code = ERR_get_error();
-
-        ERR_error_string(error_code, sslErrorBuf);
-        std::string errorMsg(sslErrorBuf, OPENSSL_ERROR_STRING_SIZE);
+        std::array<char, OPENSSL_ERROR_STRING_SIZE> error_buf;
+        ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
+        std::string errorMsg(error_buf.data());
 
         if (error_code == 0)
             errorMsg = "Error code was 0. Are you really connecting to a TLS socket?";
@@ -134,11 +117,10 @@ void IoWrapper::startOrContinueSslConnect()
 void IoWrapper::startOrContinueSslAccept()
 {
     ERR_clear_error();
-    int accepted = SSL_accept(ssl);
-    char sslErrorBuf[OPENSSL_ERROR_STRING_SIZE];
+    int accepted = SSL_accept(ssl.get());
     if (accepted <= 0)
     {
-        int err = SSL_get_error(ssl, accepted);
+        int err = SSL_get_error(ssl.get(), accepted);
 
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
         {
@@ -147,14 +129,13 @@ void IoWrapper::startOrContinueSslAccept()
         }
 
         unsigned long error_code = ERR_get_error();
-
-        ERR_error_string(error_code, sslErrorBuf);
-        std::string errorMsg(sslErrorBuf, OPENSSL_ERROR_STRING_SIZE);
+        std::array<char, OPENSSL_ERROR_STRING_SIZE> error_buf;
+        ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
+        std::string errorMsg(error_buf.data());
 
         if (error_code == OPENSSL_WRONG_VERSION_NUMBER)
             errorMsg = "Wrong protocol version number. Probably a non-SSL connection on SSL socket.";
 
-        //ERR_print_errors_cb(logSslError, NULL);
         throw std::runtime_error("Problem accepting SSL socket: " + errorMsg);
     }
     parentClient->setReadyForWriting(false); // Undo write readiness that may have have happened during SSL handshake
@@ -178,7 +159,7 @@ bool IoWrapper::isSslAccepted() const
 
 bool IoWrapper::isSsl() const
 {
-    return this->ssl != nullptr;
+    return this->ssl;
 }
 
 static int verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
@@ -190,14 +171,8 @@ static int verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     if (mode == SSL_VERIFY_NONE)
         return 1;
 
-    std::vector<char> buf(512);
-
-    X509 *err_cert = X509_STORE_CTX_get_current_cert(ctx);
-    int err = X509_STORE_CTX_get_error(ctx);
-    int depth = X509_STORE_CTX_get_error_depth(ctx);
-
-    X509_NAME_oneline(X509_get_subject_name(err_cert), buf.data(), 256);
-    const std::string subject_name(buf.data());
+    std::optional<int> err;
+    const int depth = X509_STORE_CTX_get_error_depth(ctx);
 
     /*
      * Explicity catch long chains, to avoid other random chain errors.
@@ -206,17 +181,24 @@ static int verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     {
         preverify_ok = 0;
         err = X509_V_ERR_CERT_CHAIN_TOO_LONG;
-        X509_STORE_CTX_set_error(ctx, err);
+        X509_STORE_CTX_set_error(ctx, err.value());
     }
-
-    Logger *logger = Logger::getInstance();
 
     if (!preverify_ok)
     {
-        X509_NAME_oneline(X509_get_issuer_name(err_cert), buf.data(), 256);
+        if (!err)
+            err = X509_STORE_CTX_get_error(ctx);
+
+        std::array<char, 256> buf;
+        const X509 *err_cert = X509_STORE_CTX_get_current_cert(ctx);
+        X509_NAME_oneline(X509_get_subject_name(err_cert), buf.data(), buf.size());
+        const std::string subject_name(buf.data());
+
+        Logger *logger = Logger::getInstance();
+        X509_NAME_oneline(X509_get_issuer_name(err_cert), buf.data(), buf.size());
         const std::string issuer(buf.data());
-        logger->logf(LOG_ERR, "X509 verify error. Num=%d. Error: %s. Depth=%d. Subject = %s. Issuer = %s",
-                     err, X509_verify_cert_error_string(err), depth, subject_name.c_str(), issuer.c_str());
+        logger->log(LOG_ERROR) << "X509 verify error. Num=" << err.value() << ". Error: " << X509_verify_cert_error_string(err.value())
+                               << ". Depth=" << depth << ". Subject = " << subject_name << ". Issuer = " << issuer;
     }
 
     return preverify_ok;
@@ -229,18 +211,18 @@ void IoWrapper::setSslVerify(int mode, const std::string &hostname)
     if (!ssl)
         return;
 
-    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    SSL_set_hostflags(ssl.get(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
 
     if (!hostname.empty())
     {
-        if (!SSL_set1_host(ssl, hostname.c_str()))
+        if (!SSL_set1_host(ssl.get(), hostname.c_str()))
             throw std::runtime_error("Failed setting hostname of SSL context.");
 
-        if (SSL_set_tlsext_host_name(ssl, hostname.c_str()) != 1)
+        if (SSL_set_tlsext_host_name(ssl.get(), hostname.c_str()) != 1)
             throw std::runtime_error("Failed setting SNI hostname of SSL context.");
     }
 
-    SSL_set_verify(ssl, mode, verify_callback);
+    SSL_set_verify(ssl.get(), mode, verify_callback);
 }
 
 bool IoWrapper::hasPendingWrite() const
@@ -261,21 +243,16 @@ bool IoWrapper::hasProcessedBufferedBytesToRead() const
     bool result = false;
 
     if (ssl)
-        result |= SSL_pending(ssl) > 0;
+        result |= SSL_pending(ssl.get()) > 0;
 
     /*
      * Note that this is tecnhically not 100% correct. If the only bytes are part of a header, doing a read will actually
      * result in 0 bytes. But, for the intended purpose at time of writing (see git), we can get away with this.
      */
-    if (websocket)
+    if (connectionProtocol == ConnectionProtocol::WebsocketMqtt)
         result |= websocketPendingBytes.usedBytes() > 0;
 
     return result;
-}
-
-bool IoWrapper::isWebsocket() const
-{
-    return websocket;
 }
 
 WebsocketState IoWrapper::getWebsocketState() const
@@ -285,13 +262,13 @@ WebsocketState IoWrapper::getWebsocketState() const
 
 X509Manager IoWrapper::getPeerCertificate() const
 {
-    X509Manager result(this->ssl);
+    X509Manager result(this->ssl.get());
     return result;
 }
 
 const char *IoWrapper::getSslVersion() const
 {
-    return SSL_get_version(ssl);
+    return SSL_get_version(ssl.get());
 }
 
 bool IoWrapper::needsHaProxyParsing() const
@@ -303,78 +280,84 @@ bool IoWrapper::needsHaProxyParsing() const
  * @brief IoWrapper::readHaProxyData Reads the PROXY protocol header in one go. It must fit in one TCP segment.
  * @param fd
  * @param addr
+ *
+ * https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
  */
-HaProxyConnectionType IoWrapper::readHaProxyData(int fd, struct sockaddr *addr)
+std::tuple<HaProxyConnectionType, std::optional<FMQSockaddr>> IoWrapper::readHaProxyData(int fd)
 {
     _needsHaProxyParsing = false;
 
-    constexpr const int sig_len = 12;
-    constexpr const int min_len = 16;
-    const std::string signature("\r\n\r\n\0\r\nQUIT\n", sig_len);
+    struct proxy_hdr_v2 hdr;
+    memset(&hdr, 0, sizeof(hdr));
 
-    char buf[min_len];
-    memset(buf, 0, min_len);
+    const size_t read = read_ha_proxy_helper(fd, &hdr, sizeof(hdr));
 
-    read_ha_proxy_helper(fd, buf, min_len);
+    if (read != sizeof(hdr))
+        throw std::runtime_error("Reading haproxy header resulted in wrong number of bytes.");
 
-    int i = 0;
-
-    const std::string received_signature(buf, sig_len);
-    i += sig_len;
-
-    if (received_signature != signature)
+    if (std::memcmp(hdr.sig, "\r\n\r\n\0\r\nQUIT\n", 12) != 0)
         throw std::runtime_error("Invalid HAProxy signature.");
 
-    const uint8_t ver_cmd = buf[i++];
-    const uint8_t fam_prot = buf[i++];
-    const uint8_t family = (fam_prot & 0xF0) >> 4;
-    const uint8_t prot = fam_prot & 0x0F;
+    const uint8_t family = (hdr.fam & 0xF0) >> 4;
+    const uint8_t prot = hdr.fam & 0x0F;
 
-    const uint8_t ver = (ver_cmd & 0xF0) >> 4;
-    const uint8_t cmd = ver_cmd & 0x0F;
+    const uint8_t ver = (hdr.ver_cmd & 0xF0) >> 4;
+    const uint8_t cmd = hdr.ver_cmd & 0x0F;
 
-    const uint8_t len_high = buf[i++];
-    const uint8_t len_low = buf[i++];
-    const uint16_t len = len_high | len_low;
+    const uint16_t len = ntohs(hdr.len);
 
     if (len > sizeof(union proxy_addr))
         throw std::runtime_error("Hacker be gone.");
 
-    union proxy_addr proxy_addr;
-    memset(&proxy_addr, 0, sizeof(union proxy_addr));
-    read_ha_proxy_helper(fd, &proxy_addr, len);
+    std::array<char, sizeof(union proxy_addr)> addr_block;
+    std::fill(addr_block.begin(), addr_block.end(), 0);
+    read_ha_proxy_helper(fd, addr_block.data(), len);
 
     if (ver != 2)
         throw std::runtime_error("Only HAProxy protocol version 2 is supported");
 
     if (cmd == 0)
-        return HaProxyConnectionType::Local;
+        return {HaProxyConnectionType::Local, {}};
 
     if (cmd != 1)
         throw std::runtime_error("HAProxy command must be 1");
 
     if (prot == 0)
-        return HaProxyConnectionType::Local;
+        return {HaProxyConnectionType::Local, {}};
 
     if (prot > 2)
         throw std::runtime_error("Invalid protocol in HAProxy.");
 
     if (family == 1)
     {
-        struct sockaddr_in *a = reinterpret_cast<struct sockaddr_in*>(addr);
-        a->sin_family = AF_INET;
-        a->sin_addr.s_addr = proxy_addr.ipv4_addr.src_addr;
-        a->sin_port = proxy_addr.ipv4_addr.src_port;
+        struct proxy_ipv4_addr paddr;
+        std::memcpy(&paddr, addr_block.data(), sizeof(paddr));
+
+        struct sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = paddr.src_addr;
+        addr.sin_port = paddr.src_port;
+
+        return {HaProxyConnectionType::Remote, FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr))};
     }
     else if (family == 2)
     {
-        struct sockaddr_in6 *a = reinterpret_cast<struct sockaddr_in6*>(addr);
-        a->sin6_family = AF_INET6;
-        memcpy(&a->sin6_addr, proxy_addr.ipv6_addr.src_addr, 16);
-        a->sin6_port = proxy_addr.ipv6_addr.src_port;
+        struct proxy_ipv6_addr paddr;
+        std::memcpy(&paddr, addr_block.data(), sizeof(paddr));
+
+        struct sockaddr_in6 addr;
+        std::memset(&addr, 0, sizeof(addr));
+
+        addr.sin6_family = AF_INET6;
+        memcpy(&addr.sin6_addr, paddr.src_addr, sizeof(struct in6_addr));
+        addr.sin6_port = paddr.src_port;
+
+        return {HaProxyConnectionType::Remote, FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr))};
     }
 
-    return HaProxyConnectionType::Remote;
+    throw std::runtime_error("Unsupported haproxy address family");
 }
 
 void IoWrapper::setHaProxy(bool val)
@@ -429,12 +412,12 @@ ssize_t IoWrapper::readOrSslRead(int fd, void *buf, size_t nbytes, IoWrapResult 
     {
         this->sslReadWantsWrite = false;
         ERR_clear_error();
-        ssize_t n = SSL_read(ssl, buf, nbytes);
+        ssize_t n = SSL_read(ssl.get(), buf, nbytes);
 
         if (n > 0)
             return n;
 
-        int err = SSL_get_error(ssl, n);
+        int err = SSL_get_error(ssl.get(), n);
         unsigned long error_code = ERR_get_error();
 
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
@@ -490,9 +473,9 @@ ssize_t IoWrapper::readOrSslRead(int fd, void *buf, size_t nbytes, IoWrapResult 
             throw std::runtime_error("SSL read syscall error: " + msg);
         }
 
-        char sslErrorBuf[OPENSSL_ERROR_STRING_SIZE];
-        ERR_error_string(error_code, sslErrorBuf);
-        std::string errorString(sslErrorBuf, OPENSSL_ERROR_STRING_SIZE);
+        std::array<char, OPENSSL_ERROR_STRING_SIZE> error_buf;
+        ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
+        const std::string errorString(error_buf.data());
         ERR_print_errors_cb(logSslError, NULL);
         throw std::runtime_error("SSL socket error reading: " + errorString);
     }
@@ -540,12 +523,11 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
         this->incompleteSslWrite.reset();
 
         ERR_clear_error();
-        char sslErrorBuf[OPENSSL_ERROR_STRING_SIZE];
-        n = SSL_write(ssl, buf, nbytes_);
+        n = SSL_write(ssl.get(), buf, nbytes_);
 
         if (n <= 0)
         {
-            int err = SSL_get_error(ssl, n);
+            int err = SSL_get_error(ssl.get(), n);
             unsigned long error_code = ERR_get_error();
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             {
@@ -573,8 +555,10 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
                         throw std::runtime_error(msg);
                     }
                 }
-                ERR_error_string(error_code, sslErrorBuf);
-                std::string errorString(sslErrorBuf, OPENSSL_ERROR_STRING_SIZE);
+
+                std::array<char, OPENSSL_ERROR_STRING_SIZE> error_buf;
+                ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
+                const std::string errorString(error_buf.data());
                 ERR_print_errors_cb(logSslError, NULL);
                 throw std::runtime_error("SSL socket error writing: " + errorString);
             }
@@ -598,7 +582,7 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
  */
 ssize_t IoWrapper::readWebsocketAndOrSsl(int fd, void *buf, size_t nbytes, IoWrapResult *error)
 {
-    if (!websocket)
+    if (connectionProtocol < ConnectionProtocol::WebsocketMqtt)
     {
         return readOrSslRead(fd, buf, nbytes, error);
     }
@@ -620,17 +604,17 @@ ssize_t IoWrapper::readWebsocketAndOrSsl(int fd, void *buf, size_t nbytes, IoWra
         {
             if (websocketState == WebsocketState::NotUpgraded)
             {
-                if (websocketPendingBytes.getSize() * 2 <= 8192)
-                    websocketPendingBytes.doubleSize();
+                if (websocketPendingBytes.getCapacity() * 2 <= 8192)
+                    websocketPendingBytes.doubleCapacity();
                 else
                     throw BadClientException("Trying to exceed websocket buffer. Probably not valid websocket traffic.");
             }
             else
             {
                 const Settings *settings = ThreadGlobals::getSettings();
-                if (websocketPendingBytes.getSize() * 2 <= settings->clientMaxWriteBufferSize)
+                if (websocketPendingBytes.getCapacity() * 2 <= settings->clientMaxWriteBufferSize)
                 {
-                    websocketPendingBytes.doubleSize();
+                    websocketPendingBytes.doubleCapacity();
                 }
                 else
                 {
@@ -654,33 +638,42 @@ ssize_t IoWrapper::readWebsocketAndOrSsl(int fd, void *buf, size_t nbytes, IoWra
     {
         try
         {
-            std::string websocketKey;
-            int websocketVersion;
-            std::string subprotocol;
-            std::string xRealIp;
+            std::optional<HttpRequest> req = parseHttpHeader(websocketPendingBytes);
 
-            if (!parseHttpHeader(websocketPendingBytes, websocketKey, websocketVersion, subprotocol, xRealIp))
+            if (!req)
                 return 0;
 
-            if (websocketKey.empty())
+            const HttpRequest::Data &req_data = req.value().value();
+
+            if (parentClient->getAcmeRedirectUrl() && startsWith(req_data.request, "/.well-known/acme-challenge/"))
+            {
+                parentClient->respondWithRedirectURL(req_data.request);
+                return 0;
+            }
+
+            if (!req_data.connectionUpgrade || !req_data.upgrade)
+                throw BadHttpRequest("HTTP request is not a websocket upgrade request.");
+            if (!req_data.subprotocol)
+                throw BadHttpRequest("HTTP header Sec-WebSocket-Protocol with value 'mqtt' must be present.");
+            if (!req_data.websocketKey)
                 throw BadHttpRequest("No websocket key specified.");
-            if (websocketVersion != 13)
+            if (req_data.websocketVersion != 13)
                 throw BadWebsocketVersionException("Websocket version 13 required.");
 
-            const std::string acceptString = generateWebsocketAcceptString(websocketKey);
+            const std::string acceptString = generateWebsocketAcceptString(req_data.websocketKey.value());
 
             const Settings *settings = ThreadGlobals::getSettings();
             const size_t initialBufferSize = settings->clientInitialBufferSize;
 
-            std::string answer = generateWebsocketAnswer(acceptString, subprotocol);
+            std::string answer = generateWebsocketAnswer(acceptString, req_data.subprotocol.value());
             parentClient->writeText(answer);
             websocketState = WebsocketState::Upgrading;
             websocketPendingBytes.reset();
-            websocketPendingBytes.resetSize(initialBufferSize);
+            websocketPendingBytes.resetCapacity(initialBufferSize);
             *error = IoWrapResult::Success;
 
-            if (!xRealIp.empty())
-                parentClient->setAddr(xRealIp);
+            if (req_data.xRealIp)
+                parentClient->setAddr(req_data.xRealIp.value());
 
             return 0;
         }
@@ -813,9 +806,7 @@ ssize_t IoWrapper::websocketBytesToReadBuffer(void *buf, const size_t nbytes, Io
             const size_t frame_bytes_left = std::min<size_t>(websocketPendingBytes.usedBytes(), incompleteWebsocketRead.frame_bytes_left);
             const size_t max_read_size = std::min<size_t>(frame_bytes_left, nbytes - nbytesRead);
 
-            assert(max_read_size + nbytesRead <= nbytes);
-            if (max_read_size + nbytesRead > nbytes)
-                raise(SIGABRT);
+            FMQ_ENSURE(max_read_size + nbytesRead <= nbytes);
 
             char *offset_in_buf = &static_cast<char*>(buf)[nbytesRead];
             for (size_t x = 0; x < max_read_size; x++)
@@ -1009,7 +1000,7 @@ ssize_t IoWrapper::writeWebsocketAndOrSsl(int fd, const void *buf, size_t nbytes
 {
     if (websocketState != WebsocketState::Upgraded)
     {
-        if (websocket && websocketState == WebsocketState::Upgrading)
+        if (connectionProtocol == ConnectionProtocol::WebsocketMqtt && websocketState == WebsocketState::Upgrading)
             websocketState = WebsocketState::Upgraded;
 
         return writeOrSslWrite(fd, buf, nbytes, error);
@@ -1037,7 +1028,7 @@ void IoWrapper::resetBuffersIfEligible()
     const Settings *settings = ThreadGlobals::getSettings();
     const size_t initialBufferSize = settings->clientInitialBufferSize;
 
-    const size_t sz = websocket ? initialBufferSize : 0;
-    websocketPendingBytes.resetSizeIfEligable(sz),
-    websocketWriteRemainder.resetSizeIfEligable(sz);
+    const size_t sz = connectionProtocol == ConnectionProtocol::WebsocketMqtt ? initialBufferSize : 0;
+    websocketPendingBytes.resetCapacityIfEligable(sz);
+    websocketWriteRemainder.resetCapacityIfEligable(sz);
 }

@@ -56,14 +56,9 @@ void MainTests::testWebsocketPing()
     try
     {
         Settings settings;
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
 
         int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
         FileCloser listener_closer(listen_socket);
@@ -71,20 +66,20 @@ void MainTests::testWebsocketPing()
         int optval = 1;
         check<std::runtime_error>(setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval, sizeof(optval)));
 
-        BindAddr bindAddr = getBindAddr(AF_INET, "127.0.0.1", 22123);
+        BindAddr bindAddr(AF_INET, "127.0.0.1", 22123);
 
-        check<std::runtime_error>(bind(listen_socket, bindAddr.p.get(), bindAddr.len));
+        check<std::runtime_error>(bind(listen_socket, bindAddr.get(), bindAddr.getLen()));
         check<std::runtime_error>(listen(listen_socket, 64));
 
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         int flags = fcntl(listen_socket, F_GETFL);
         check<std::runtime_error>(fcntl(client_socket, F_SETFL, flags | O_NONBLOCK ));
 
-        std::shared_ptr<Client> c1(new Client(client_socket, t, nullptr, true, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, client_socket, t, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, false));
         std::shared_ptr<Client> client = c1;
         t->giveClient(std::move(c1));
 
-        ::connect(client_socket, bindAddr.p.get(), bindAddr.len);
+        ::connect(client_socket, bindAddr.get(), bindAddr.getLen());
 
         int socket_to_client = accept(listen_socket, nullptr, nullptr);
         FileCloser socket_to_client_closer(socket_to_client);
@@ -239,14 +234,9 @@ void MainTests::testWebsocketCorruptLengthFrame()
     try
     {
         Settings settings;
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
 
         int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
         FileCloser listener_closer(listen_socket);
@@ -254,20 +244,20 @@ void MainTests::testWebsocketCorruptLengthFrame()
         int optval = 1;
         check<std::runtime_error>(setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval, sizeof(optval)));
 
-        BindAddr bindAddr = getBindAddr(AF_INET, "127.0.0.1", 22123);
+        BindAddr bindAddr(AF_INET, "127.0.0.1", 22123);
 
-        check<std::runtime_error>(bind(listen_socket, bindAddr.p.get(), bindAddr.len));
+        check<std::runtime_error>(bind(listen_socket, bindAddr.get(), bindAddr.getLen()));
         check<std::runtime_error>(listen(listen_socket, 64));
 
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         int flags = fcntl(listen_socket, F_GETFL);
         check<std::runtime_error>(fcntl(client_socket, F_SETFL, flags | O_NONBLOCK ));
 
-        std::shared_ptr<Client> c1(new Client(client_socket, t, nullptr, true, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, client_socket, t, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, false));
         std::shared_ptr<Client> client = c1;
         t->giveClient(std::move(c1));
 
-        ::connect(client_socket, bindAddr.p.get(), bindAddr.len);
+        ::connect(client_socket, bindAddr.get(), bindAddr.getLen());
 
         int socket_to_client = accept(listen_socket, nullptr, nullptr);
         FileCloser socket_to_client_closer(socket_to_client);
@@ -371,14 +361,9 @@ void MainTests::testWebsocketHugePing()
     try
     {
         Settings settings;
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
 
         int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
         FileCloser listener_closer(listen_socket);
@@ -386,20 +371,20 @@ void MainTests::testWebsocketHugePing()
         int optval = 1;
         check<std::runtime_error>(setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval, sizeof(optval)));
 
-        BindAddr bindAddr = getBindAddr(AF_INET, "127.0.0.1", 22123);
+        BindAddr bindAddr(AF_INET, "127.0.0.1", 22123);
 
-        check<std::runtime_error>(bind(listen_socket, bindAddr.p.get(), bindAddr.len));
+        check<std::runtime_error>(bind(listen_socket, bindAddr.get(), bindAddr.getLen()));
         check<std::runtime_error>(listen(listen_socket, 64));
 
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         int flags = fcntl(listen_socket, F_GETFL);
         check<std::runtime_error>(fcntl(client_socket, F_SETFL, flags | O_NONBLOCK ));
 
-        std::shared_ptr<Client> c1(new Client(client_socket, t, nullptr, true, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, client_socket, t, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, false));
         std::shared_ptr<Client> client = c1;
         t->giveClient(std::move(c1));
 
-        ::connect(client_socket, bindAddr.p.get(), bindAddr.len);
+        ::connect(client_socket, bindAddr.get(), bindAddr.getLen());
 
         int socket_to_client = accept(listen_socket, nullptr, nullptr);
         FileCloser socket_to_client_closer(socket_to_client);
@@ -496,14 +481,9 @@ void MainTests::testWebsocketManyBigPingFrames()
         MYCASTCOMPARE(settings.clientMaxWriteBufferSize, 1048576);
         MYCASTCOMPARE(settings.clientInitialBufferSize, 1024);
 
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
 
         int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
         FileCloser listener_closer(listen_socket);
@@ -511,20 +491,20 @@ void MainTests::testWebsocketManyBigPingFrames()
         int optval = 1;
         check<std::runtime_error>(setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval, sizeof(optval)));
 
-        BindAddr bindAddr = getBindAddr(AF_INET, "127.0.0.1", 22123);
+        BindAddr bindAddr(AF_INET, "127.0.0.1", 22123);
 
-        check<std::runtime_error>(bind(listen_socket, bindAddr.p.get(), bindAddr.len));
+        check<std::runtime_error>(bind(listen_socket, bindAddr.get(), bindAddr.getLen()));
         check<std::runtime_error>(listen(listen_socket, 64));
 
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         int flags = fcntl(listen_socket, F_GETFL);
         check<std::runtime_error>(fcntl(client_socket, F_SETFL, flags | O_NONBLOCK ));
 
-        std::shared_ptr<Client> c1(new Client(client_socket, t, nullptr, true, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, client_socket, t, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, false));
         std::shared_ptr<Client> client = c1;
         t->giveClient(std::move(c1));
 
-        ::connect(client_socket, bindAddr.p.get(), bindAddr.len);
+        ::connect(client_socket, bindAddr.get(), bindAddr.getLen());
 
         int socket_to_client = accept(listen_socket, nullptr, nullptr);
         FileCloser socket_to_client_closer(socket_to_client);
@@ -647,14 +627,9 @@ void MainTests::testWebsocketClose()
     try
     {
         Settings settings;
-        PluginLoader pluginLoader;
+        std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
         std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
-
-        // Kind of a hack...
-        Authentication auth(settings);
-        ThreadGlobals::assign(&auth);
-        ThreadGlobals::assignThreadData(t.get());
 
         int listen_socket = socket(AF_INET, SOCK_STREAM, 0);
         FileCloser listener_closer(listen_socket);
@@ -662,20 +637,20 @@ void MainTests::testWebsocketClose()
         int optval = 1;
         check<std::runtime_error>(setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &optval, sizeof(optval)));
 
-        BindAddr bindAddr = getBindAddr(AF_INET, "127.0.0.1", 22123);
+        BindAddr bindAddr(AF_INET, "127.0.0.1", 22123);
 
-        check<std::runtime_error>(bind(listen_socket, bindAddr.p.get(), bindAddr.len));
+        check<std::runtime_error>(bind(listen_socket, bindAddr.get(), bindAddr.getLen()));
         check<std::runtime_error>(listen(listen_socket, 64));
 
         int client_socket = socket(AF_INET, SOCK_STREAM, 0);
         int flags = fcntl(listen_socket, F_GETFL);
         check<std::runtime_error>(fcntl(client_socket, F_SETFL, flags | O_NONBLOCK ));
 
-        std::shared_ptr<Client> c1(new Client(client_socket, t, nullptr, true, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, client_socket, t, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, false));
         std::shared_ptr<Client> client = c1;
         t->giveClient(std::move(c1));
 
-        ::connect(client_socket, bindAddr.p.get(), bindAddr.len);
+        ::connect(client_socket, bindAddr.get(), bindAddr.getLen());
 
         int socket_to_client = accept(listen_socket, nullptr, nullptr);
         FileCloser socket_to_client_closer(socket_to_client);

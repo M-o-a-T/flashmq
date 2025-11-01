@@ -85,9 +85,7 @@ AddSubscriptionType SubscriptionNode::addSubscriber(
     }
     else
     {
-        SharedSubscribers &subscribers = sharedSubscribers[shareName];
-        subscribers.setName(shareName); // c++14 doesn't have try-emplace yet, in which case this separate step wouldn't be needed.
-
+        SharedSubscribers &subscribers = sharedSubscribers.try_emplace(shareName, shareName, subscriber->getFmqClientGroupId()).first->second;
         Subscription &s = subscribers[client_id];
         result = s.session.expired() ? AddSubscriptionType::NewSubscription : AddSubscriptionType::ExistingSubscription;
         s = sub;
@@ -291,8 +289,8 @@ std::shared_ptr<Session> SubscriptionStore::getBridgeSession(std::shared_ptr<Cli
 
     std::shared_ptr<Session> &session = sessionsById[client_id];
 
-    if (!session)
-        session = std::make_shared<Session>(client_id, client->getUsername());
+    if (!session || session->getDestroyOnDisconnect() || client->getCleanStart())
+        session = std::make_shared<Session>(client_id, client->getUsername(), client->getFmqClientGroupId());
 
     session->assignActiveConnection(client);
     client->assignSession(session);
@@ -346,6 +344,9 @@ void SubscriptionStore::registerClientAndKickExistingOne(std::shared_ptr<Client>
                 if (session->getUsername() != client->getUsername())
                     throw ProtocolError("Cannot take over session with different username", ReasonCodes::NotAuthorized);
 
+                if (session->getFmqClientGroupId() != client->getFmqClientGroupId())
+                    throw ProtocolError("Cannot take over session with different FMQ client group ID", ReasonCodes::NotAuthorized);
+
                 std::shared_ptr<Client> clientOfOtherSession = session->makeSharedClient();
 
                 if (clientOfOtherSession)
@@ -361,7 +362,7 @@ void SubscriptionStore::registerClientAndKickExistingOne(std::shared_ptr<Client>
         if (!session || session->getDestroyOnDisconnect() || clean_start)
         {
             // Don't use sdt::make_shared to avoid the weak pointers from retaining the size of session in the control block.
-            session = std::shared_ptr<Session>(new Session(client->getClientId(), client->getUsername()));
+            session = std::shared_ptr<Session>(new Session(client->getClientId(), client->getUsername(), client->getFmqClientGroupId()));
 
             sessionsById[client->getClientId()] = session;
         }
@@ -407,13 +408,16 @@ void SubscriptionStore::sendWill(const std::shared_ptr<WillPublish> will, const 
 
     logger->log(LOG_DEBUG) << log << " " << will->topic;
 
-    Authentication &auth = *ThreadGlobals::getAuth();
+    Authentication &auth = ThreadGlobals::getThreadData()->authentication;
     const AuthResult authResult = auth.aclCheck(*will, will->payload, AclAccess::write);
 
     if (authResult == AuthResult::success || authResult == AuthResult::success_without_setting_retained)
     {
         PublishCopyFactory factory(will.get());
-        queuePacketAtSubscribers(factory, will->client_id);
+
+        // Not having a stored fmq_client_group_id to pass. Theoretically, it should not be needed,
+        // because a client cannot get its own will.
+        queuePacketAtSubscribers(factory, will->client_id, {});
 
         if (will->retain && authResult == AuthResult::success)
             setRetainedMessage(*will, will->getSubtopics());
@@ -500,7 +504,8 @@ void SubscriptionStore::queueWillMessage(const std::shared_ptr<WillPublish> &wil
 }
 
 void SubscriptionStore::publishNonRecursively(
-    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions, const std::string &senderClientId) noexcept
+    SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions,
+    const std::string &senderClientId, const std::optional<std::string> &fmq_client_group_id) noexcept
 {
     std::shared_lock locker(this_node->lock);
 
@@ -537,16 +542,19 @@ void SubscriptionStore::publishNonRecursively(
     {
         SharedSubscribers &subscribers = pair.second;
 
+        // See SharedSubscribers for details about the target override. In short: we need to ensure delivery order.
+        const SharedSubscriptionTargeting targetting = subscribers.overrideSharedSubscriptionTarget.value_or(settings->sharedSubscriptionTargeting);
+
         const Subscription *sub = nullptr;
 
-        if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::SenderHash)
+        if (targetting == SharedSubscriptionTargeting::SenderHash)
         {
             const size_t hash = std::hash<std::string>()(senderClientId);
             sub = subscribers.getNext(hash);
         }
-        else if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::RoundRobin)
+        else if (targetting == SharedSubscriptionTargeting::RoundRobin)
             sub = subscribers.getNext();
-        else if (settings->sharedSubscriptionTargeting == SharedSubscriptionTargeting::First)
+        else if (targetting == SharedSubscriptionTargeting::First)
             sub = subscribers.getFirst();
 
         if (sub == nullptr)
@@ -561,10 +569,16 @@ void SubscriptionStore::publishNonRecursively(
         }
 
         /*
-         * We don't filter out 'no local' subscriptions:
-         *
-         * It is a Protocol Error to set the No Local bit to 1 on a Shared Subscription [MQTT-3.8.3-4]
+         * Normal shared subscriptions are not supposed to filter out the 'no local' subscriptions (MQTT-3.8.3-4),
+         * because it would create inconsistent behavior depending on which client gets it. So, we implement a
+         * custom feature.
          */
+        const std::optional<std::string> &session_group_id = targetSessions.back().session->getFmqClientGroupId();
+        if (session_group_id && session_group_id == fmq_client_group_id)
+        {
+            targetSessions.pop_back();
+            continue;
+        }
     }
 }
 
@@ -582,18 +596,18 @@ void SubscriptionStore::publishNonRecursively(
 void SubscriptionStore::publishRecursively(
     std::vector<std::string>::const_iterator cur_subtopic_it, std::vector<std::string>::const_iterator end,
     SubscriptionNode *this_node, std::vector<ReceivingSubscriber> &targetSessions,
-    const std::string &senderClientId) noexcept
+    const std::string &senderClientId, const std::optional<std::string> &fmq_client_group_id) noexcept
 {
     if (cur_subtopic_it == end) // This is the end of the topic path, so look for subscribers here.
     {
         if (this_node)
         {
-            publishNonRecursively(this_node, targetSessions, senderClientId);
+            publishNonRecursively(this_node, targetSessions, senderClientId, fmq_client_group_id);
 
             // Subscribing to 'one/two/three/#' also gives you 'one/two/three'.
             if (this_node->childrenPound)
             {
-                publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId);
+                publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId, fmq_client_group_id);
             }
         }
         return;
@@ -612,23 +626,24 @@ void SubscriptionStore::publishRecursively(
 
     if (this_node->childrenPound)
     {
-        publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId);
+        publishNonRecursively(this_node->childrenPound.get(), targetSessions, senderClientId, fmq_client_group_id);
     }
 
     const auto &sub_node = this_node->children.find(cur_subtop);
 
     if (this_node->childrenPlus)
     {
-        publishRecursively(next_subtopic, end, this_node->childrenPlus.get(), targetSessions, senderClientId);
+        publishRecursively(next_subtopic, end, this_node->childrenPlus.get(), targetSessions, senderClientId, fmq_client_group_id);
     }
 
     if (sub_node != this_node->children.end())
     {
-        publishRecursively(next_subtopic, end, sub_node->second.get(), targetSessions, senderClientId);
+        publishRecursively(next_subtopic, end, sub_node->second.get(), targetSessions, senderClientId, fmq_client_group_id);
     }
 }
 
-void SubscriptionStore::queuePacketAtSubscribers(PublishCopyFactory &copyFactory, const std::string &senderClientId, bool dollar)
+void SubscriptionStore::queuePacketAtSubscribers(
+    PublishCopyFactory &copyFactory, const std::string &senderClientId, const std::optional<std::string> &fmq_client_group_id, bool dollar)
 {
     /*
      * Sometimes people publish or set as will topics with dollar. Node-to-Node communication for bridges for instance.
@@ -649,7 +664,7 @@ void SubscriptionStore::queuePacketAtSubscribers(PublishCopyFactory &copyFactory
     {
         const std::vector<std::string> &subtopics = copyFactory.getSubtopics();
         std::shared_lock locker(subscriptions_lock);
-        publishRecursively(subtopics.begin(), subtopics.end(), startNode, subscriberSessions, senderClientId);
+        publishRecursively(subtopics.begin(), subtopics.end(), startNode, subscriberSessions, senderClientId, fmq_client_group_id);
     }
 
     if (subscriberSessions.size() > reserve && subscriberSessions.size() <= 1048576)
@@ -676,7 +691,7 @@ void SubscriptionStore::giveClientRetainedMessagesRecursively(std::vector<std::s
 
     if (cur_subtopic_it == end)
     {
-        Authentication &auth = *ThreadGlobals::getAuth();
+        Authentication &auth = ThreadGlobals::getThreadData()->authentication;
 
         std::lock_guard<std::mutex> locker(this_node->messageSetMutex);
 
@@ -843,7 +858,7 @@ void SubscriptionStore::giveClientRetainedMessagesInitiateDeferred(const std::we
 
     if (!deferred->empty() && ++requeue_count < 100 && total_node_count < settings->retainedMessagesNodeLimit)
     {
-        ThreadData *t = ThreadGlobals::getThreadData();
+        ThreadData *t = ThreadGlobals::getThreadData().get();
         auto again = std::bind(&SubscriptionStore::giveClientRetainedMessagesInitiateDeferred, this,
                                ses, subscribeSubtopicsCopy, deferred, requeue_count, total_node_count, max_qos, subscription_identifier);
 
@@ -909,7 +924,7 @@ void SubscriptionStore::trySetRetainedMessages(const Publish &publish, const std
     const Settings *settings = ThreadGlobals::getSettings();
     const bool try_lock_fail = settings->setRetainedMessageDeferTimeout.count() != 0;
 
-    ThreadData *td = ThreadGlobals::getThreadData();
+    ThreadData *td = ThreadGlobals::getThreadData().get();
 
     if (!td)
         return;
@@ -1477,7 +1492,7 @@ std::unordered_map<std::string, std::list<SubscriptionForSerializing>> Subscript
     {
         std::shared_lock locker(subscriptions_lock, std::defer_lock);
 
-        if (Globals::getInstance().quitting)
+        if (globals->quitting)
             locker.lock();
         else
         {
@@ -1576,7 +1591,7 @@ void SubscriptionStore::saveRetainedMessages(const std::string &filePath, bool i
             getRetainedMessages(node.get(), result, limit, 10000, deferred);
         }
 
-        if (Globals::getInstance().quitting && in_background)
+        if (globals->quitting && in_background)
         {
             logger->log(LOG_NOTICE) << "Aborted background saving of retained messages because we're quitting. It will be reinitiated.";
             db.dontSaveTmpFile();

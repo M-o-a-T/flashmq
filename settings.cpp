@@ -14,18 +14,15 @@ See LICENSE for license details.
 #include "settings.h"
 #include "utils.h"
 
-void Settings::checkUniqueBridgeNames() const
+void checkUniqueBridgeNames(const std::list<BridgeConfig> &bridges)
 {
     std::unordered_set<std::string> prefixes;
 
-    for (auto &bridge : bridges)
+    for (const BridgeConfig &bridge : bridges)
     {
-        if (!bridge)
-            continue;
+        const std::string &prefix = bridge.clientidPrefix;
 
-        const std::string &prefix = bridge->clientidPrefix;
-
-        if (prefixes.find(bridge->clientidPrefix) != prefixes.end())
+        if (prefixes.find(bridge.clientidPrefix) != prefixes.end())
         {
             std::string err = formatString("Value '%s' is not unique. All bridge prefixes must be unique.", prefix.c_str());
             throw ConfigFileException(err);
@@ -72,6 +69,15 @@ std::string Settings::getBridgeNamesDBFile() const
     return path;
 }
 
+std::string Settings::getGeneratedShareNamesFilePath() const
+{
+    if (storageDir.empty())
+        return "";
+
+    std::string path = formatString("%s/%s", storageDir.c_str(), "sharenames.db");
+    return path;
+}
+
 /**
  * @brief because 0 means 'forever', we have to translate this.
  * @return
@@ -96,9 +102,9 @@ bool Settings::matchAddrWithSetRealIpFrom(const sockaddr_in *addr) const
     return matchAddrWithSetRealIpFrom(reinterpret_cast<const struct sockaddr*>(addr));
 }
 
-std::list<std::shared_ptr<BridgeConfig>> Settings::stealBridges()
+std::list<BridgeConfig> Settings::stealBridges()
 {
-    std::list<std::shared_ptr<BridgeConfig>> result = this->bridges;
+    std::list<BridgeConfig> result = std::move(this->bridges);
     this->bridges.clear();
     return result;
 }
