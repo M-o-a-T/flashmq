@@ -7,3 +7,4 @@ compile_commands.json
 /obj-*
 .cache/
 build
+FlashMQTests/build

@@ -962,15 +962,15 @@ void MainTests::testSavingSessions()
         Settings settings;
         std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
         std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
-        std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
+        std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader, std::weak_ptr<MainApp>()));
 
-        std::shared_ptr<Client> c1(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+        std::shared_ptr<Client> c1(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
         c1->setClientProperties(ProtocolVersion::Mqtt5, "c1", {}, "user1", true, 60);
         store->registerClientAndKickExistingOne(c1, false, 512, 120);
         c1->getSession()->addIncomingQoS2MessageId(2);
         c1->getSession()->addIncomingQoS2MessageId(3);
 
-        std::shared_ptr<Client> c2(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+        std::shared_ptr<Client> c2(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
         c2->setClientProperties(ProtocolVersion::Mqtt5, "c2", {}, "user2", true, 60);
         store->registerClientAndKickExistingOne(c2, false, 512, 120);
         c2->getSession()->addOutgoingQoS2MessageId(55);
@@ -1114,15 +1114,15 @@ void MainTests::testSavingSessions()
 
 void MainTests::testParsePacketHelper(const std::string &topic, uint8_t from_qos, bool retain)
 {
-    Logger::getInstance()->setFlags(LogLevel::None, false);
+    Logger::getInstance()->setFlags(LogLevel::None, false, false);
 
     Settings settings;
     settings.logLevel = LogLevel::Info;
     std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
     std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
-    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
+    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader, std::weak_ptr<MainApp>()));
 
-    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "qostestclient", {}, "user1", true, 60);
     store->registerClientAndKickExistingOne(dummyClient, false, 512, 120);
 
@@ -1182,17 +1182,17 @@ void MainTests::testParsePacket()
  */
 void MainTests::testbufferToMqttPacketsFuzz()
 {
-    Logger::getInstance()->setFlags(LogLevel::None, false);
+    Logger::getInstance()->setFlags(LogLevel::None, false, false);
 
     Settings settings;
     settings.logLevel = LogLevel::Info;
     std::shared_ptr<SubscriptionStore> store(new SubscriptionStore());
     std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
-    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
+    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader, std::weak_ptr<MainApp>()));
 
     settings.maxPacketSize = 32768;
 
-    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> dummyClient(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     dummyClient->setClientProperties(ProtocolVersion::Mqtt311, "dummy", {}, "user1", true, 60);
     store->registerClientAndKickExistingOne(dummyClient, false, 512, 120);
 
@@ -2413,6 +2413,24 @@ void MainTests::testQoSPublishQueue()
     }
 }
 
+/**
+ * relies on the leak sanitizer as part of ASAN.
+ */
+void MainTests::testQoSPublishQueueMemoryLeak()
+{
+    QoSPublishQueue q;
+
+    uint16_t id = 1;
+
+    Publish p1("one", "onepayload", 1);
+    q.queuePublish(std::move(p1), id++, std::optional<std::string>());
+
+    Publish p2("one", "onepayload", 1);
+    q.queuePublish(std::move(p2), id++, std::optional<std::string>());
+
+    FMQ_VERIFY(q.size() == 2);
+}
+
 void MainTests::testTimePointToAge()
 {
     std::chrono::time_point<std::chrono::steady_clock> now = std::chrono::steady_clock::now();
@@ -3061,7 +3079,7 @@ void MainTests::testTopicMatchingInSubscriptionTreeHelper(const std::string &sub
 
     std::shared_ptr<ThreadData> td;
     const Settings *settings = ThreadGlobals::getSettings();
-    std::shared_ptr<Client> client = std::make_shared<Client>(ClientType::Normal, 0, td, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, *settings, false);
+    std::shared_ptr<Client> client = std::make_shared<Client>(ClientType::Normal, -1, td, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, *settings, false);
     client->setClientProperties(ProtocolVersion::Mqtt5, "mytestclient", {}, "myusername", true, 60);
     store.registerClientAndKickExistingOne(client);
 

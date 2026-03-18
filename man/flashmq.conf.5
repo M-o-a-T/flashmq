@@ -5,7 +5,7 @@
 \\$2 \(la\\$1\(ra\\$3
 ..
 .if \n(.g .mso www.tmac
-.TH flashmq.conf 5 "Aug 27 2025" "" ""
+.TH flashmq.conf 5 "Jan 28 2026" "" ""
 .SH NAME
 flashmq.conf \- FlashMQ configuration file format
 .SH SYNOPSIS
@@ -92,6 +92,11 @@ Default value: \fIfalse\fR
 \*(T<\fB\m[green]log_subscriptions\m[] \fI\m[cyan]true\m[]\fR|\fI\m[cyan]false\m[]\fR\fR\*(T>
 Default value: \fIfalse\fR
 .TP
+\*(T<\fB\m[green]log_publishes\m[] \fI\m[cyan]true\m[]\fR|\fI\m[cyan]false\m[]\fR\fR\*(T>
+Both publishes and QoS actions related to publishes are logged at this level.
+
+Default value: \fIfalse\fR
+.TP
 \*(T<\fB\m[green]allow_unsafe_clientid_chars\m[] \fI\m[cyan]true\m[]\fR|\fI\m[cyan]false\m[]\fR\fR\*(T>
 If you have topics with client IDs in it, people can possibly manipulate your ACL checking by saying their client ID is 'John+foobar'. Audit your security before you allow this.
 
@@ -101,6 +106,15 @@ Default value: \fIfalse\fR
 If you have topics with usernames in it, people can possibly manipulate your ACL checking by saying their username is 'John+foobar'. Audit your security before you allow this.
 
 Default value: \fIfalse\fR
+.TP
+\*(T<\fB\m[green]max_string_length\m[] \fI\m[cyan]bytes\m[]\fR\fR\*(T>
+The max length of almost all strings encoded in MQTT packets. This includes topics, user properties, client IDs, etc. Some fields, like passwords, are excluded. Payloads are also excluded (as they are not strings).
+
+The reason is to avoid abuse. The default should be enough for most deployments.
+
+If the limit is tripped, the error in the log will clearly say so, and mention \fB\m[green]max_string_length\fR\m[].
+
+Default value: \fI4096\fR
 .TP
 \*(T<\fB\m[green]max_packet_size\m[] \fI\m[cyan]bytes\m[]\fR\fR\*(T>
 MQTT packets have a maximum size of about 256 MB. This memory will (temporarily) be allocated upon arrival of such packets, so there may be cause to set it lower.
@@ -179,6 +193,13 @@ The interval at which the state is saved, if enabled with \fB\m[green]storage_di
 This setting is also applied on reload.
 
 Default: 3623
+.TP
+\*(T<\fB\m[green]persistence_data_to_save\m[] \fI\m[cyan]all|sessions_and_subscriptions|retained_messages|bridge_info\m[]\fR\fR\*(T>
+When a \fB\m[green]storage_dir\fR\m[] is defined, specify which information should be saved. The arguments are a list of one or more of the specified options, and can be negated with a !. Meaning like: \fIall !retained_messages\fR. The order is relevant. If you end with \fIall\fR, it overrides the previous.
+
+The option \fIbridge_info\fR causes a small bit of meta data of the bridges to be saved. See the bridge option \fB\fB\m[green]use_saved_clientid\fR\m[]\fR.
+
+The default is \fIall\fR, but as soon as this option is defined, it's cleared, and the desired list has to be composed.
 .TP
 \*(T<\fB\m[green]max_qos_msg_pending_per_client\m[] \fI\m[cyan]number\m[]\fR\fR\*(T>
 .TQ
@@ -328,6 +349,15 @@ The reason you may want to limit it, is performance. If you have a base message 
 
 Default: \fI\m[cyan]0\m[]\fR
 .TP
+\*(T<\fB\m[green]max_topic_split_depth\m[] \fI\m[cyan]number\m[]\fR\fR\*(T>
+Defines the maximum number of components a topic/filter string can have. For example, \fIone/two/three\fR has three.
+
+The reason is to avoid abuse. The default should be enough for most deployments.
+
+If the limit is tripped, the error in the log will clearly say so, and mention \fB\m[green]max_topic_split_depth\fR\m[].
+
+Default: \fI\m[cyan]128\m[]\fR
+.TP
 \*(T<\fB\m[green]wildcard_subscription_deny_mode\m[] \fI\m[cyan]deny_all\m[]\fR|\fI\m[cyan]deny_retained_only\m[]\fR\fR\*(T>
 For \fB\m[green]minimum_wildcard_subscription_depth\fR\m[], specify what you want to deny. Trying to give a client all retained messages can cause quite some load, so only denying the retained messages upon receiving a broad wildcard subscription can be useful if you have a low enough general message volume, but a high number of retained messages.
 
@@ -470,12 +500,32 @@ This allows you to override the \fBglobal \fB\m[green]allow_anonymous\fR\m[]\fR 
 \*(T<\fB\m[green]overload_mode\m[] \fI\m[cyan]log\m[]\fR|\fI\m[cyan]close_new_clients\m[]\fR\fR\*(T>
 This allows you to override the \fBglobal \fB\m[green]overload_mode\fR\m[]\fR setting on the listener level.
 .TP
-\*(T<\fB\m[green]haproxy\m[] \fI\m[cyan]true\m[]\fR|\fI\m[cyan]false\m[]\fR\fR\*(T>
-Setting the listener to haproxy makes it expect the PROXY protocol and set client source address to the original client. Make sure this listener is private / firewalled, otherwise anybody can set a different source address.
+\*(T<\fB\m[green]haproxy\m[] \fI\m[cyan]off\m[]\fR|\fI\m[cyan]on\m[]\fR|\fI\m[cyan]client_verification\m[]\fR|\fI\m[cyan]client_verification_with_authn\m[]\fR\fR\*(T>
+The nature of running something behind a proxy is that you would lose certain information or abilities. For that, HAProxy allows sending information in a header frame. With the \fB\m[green]haproxy\fR\m[] option, you can configure the following:
+
+\fIoff\fR and \fIon\fR configure basic functionality: reading the client's source address from the haproxy frame. This address will be shown in the logs and plugin functions.
+
+\fIclient_verification\fR and \fIclient_verification_with_authn\fR will require haproxy to send the \fIPP2_SUBTYPE_SSL_CN\fR field when using mTLS (mutual TLS), i.e. client authentication. When using the \fIclient_verification_with_authn\fR option, FlashMQ's internal authentication will still happen (with the username from the certificate). This can be convenient when you have a plugin, so that you can still take action in the login hook.
+
+Make sure this listener is private, firewalled or use \fB\m[green]only_allow_from\fR\m[], otherwise anybody can set a different source address.
 
 Note that HAProxy's server health checks only started using the 'local' specifier as of version 2.4. This means earlier version will pretend to be a client and break the connection, causing log spam.
 
 As a side note about using a proxy on your listener; you can only have an absolute max of 65535 connections to an IP+port combination (and the practical limit is lower). If you need more, you have to set up multiple listeners. This can be multiple IP addresses, or simply multiple ports.
+
+The following is an example HAProxy backend config for the features described:
+.PP
+.nf
+.in +7
+\m[green]backend \m[]\m[cyan]backend_server\m[]
+\m[green]        mode \m[]\m[cyan]tcp\m[]
+\m[green]        timeout \m[]\m[cyan]client\m[]  \m[cyan]2m\m[]
+\m[green]        timeout \m[]\m[cyan]connect\m[] \m[cyan]10s\m[]
+\m[green]        timeout \m[]\m[cyan]server\m[]  \m[cyan]2m\m[]
+\m[green]        server \m[]\m[cyan]server1\m[] \m[cyan]::1:1885\m[] \m[cyan]send-proxy-v2\m[] \m[cyan]send-proxy-v2-ssl-cn\m[] 
+
+.in
+.fi
 
 See \m[blue]haproxy.org\m[] \(lB\fI\m[blue]http://www.haproxy.org/\m[]\fR\(rB.
 .TP
@@ -655,7 +705,7 @@ Messages will not be relayed with 'retained as published' and the retained messa
 Default value: \fItrue\fR
 .TP
 \*(T<\fB\m[green]use_saved_clientid\m[] \fI\m[cyan]true\m[]\fR|\fI\m[cyan]false\m[]\fR\fR\*(T>
-When you want your bridges to resume local and remote sessions after restart, set this to true and set \fB\m[green]remote_clean_start\fR\m[], \fB\m[green]local_clean_start\fR\m[], \fB\m[green]remote_session_expiry_interval\fR\m[] and \fB\m[green]local_session_expiry_interval\fR\m[] accordingly. It only has effect when you have set a \fB\m[green]storage_dir\fR\m[].
+When you want your bridges to resume local and remote sessions after restart, set this to true and set \fB\m[green]remote_clean_start\fR\m[], \fB\m[green]local_clean_start\fR\m[], \fB\m[green]remote_session_expiry_interval\fR\m[] and \fB\m[green]local_session_expiry_interval\fR\m[] accordingly. It only has effect when you have set a \fB\m[green]storage_dir\fR\m[] and include \fIbridge_info\fR in \fB\m[green]persistence_data_to_save\fR\m[].
 
 It is important to fully understand the clean session / clean start behavior and the role the client ID plays in that. The primary goal of sessions is to survive link disconnects. Configuring a fixed client ID and use that each time an MQTT client starts, is often an anti-pattern, because most clients like actual IoT devices start fresh upon restart and don't store their sessions (with in-flight packets, etc) to disk. FlashMQ does store it on disk however, so it can be used legitamately. However, you can run into unexpected situations. For instance, you will get your existing subscriptions from the session too. So, if you remove a \fB\m[green]subscribe\fR\m[] line from your bridge configuration and restart, it will actually have no effect, because the server on the other side still has that subscription in the session.
 

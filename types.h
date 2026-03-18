@@ -254,7 +254,11 @@ public:
 
     Publish() = default;
     Publish(const std::string &topic, const std::string &payload, uint8_t qos);
+    Publish(const std::string &topic, const std::string &payload, uint8_t qos, bool retain, uint32_t expiryInterval,
+            const std::vector<std::pair<std::string, std::string>> *userProperties,
+            const std::string *responseTopic, const std::string *correlationData, const std::string *contentType);
     bool hasExpired() const;
+    std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiresAt() const;
 
     template<typename T>
     T getAge() const
@@ -265,7 +269,6 @@ public:
         return std::chrono::duration_cast<T>(std::chrono::steady_clock::now() - this->expireInfo->createdAt);
     }
 
-    std::chrono::seconds getAge() const;
     std::vector<std::pair<std::string, std::string>> *getUserProperties() const;
     void addUserProperty(const std::string &key, const std::string &val);
     void addUserProperty(std::string &&key, std::string &&val);
@@ -353,16 +356,13 @@ struct Connect
  */
 struct Subscribe
 {
-    const ProtocolVersion protocolVersion;
-    uint16_t packetId;
     std::string topic;
     uint8_t qos;
     bool noLocal = false;
     bool retainAsPublished = false;
-    uint32_t subscriptionIdentifier = 0;
     RetainHandling retainHandling = RetainHandling::SendRetainedMessagesAtSubscribe;
 
-    Subscribe(const ProtocolVersion protocolVersion, uint16_t packetId, const std::string &topic, uint8_t qos);
+    Subscribe(const std::string &topic, uint8_t qos);
 };
 
 /**
@@ -372,13 +372,9 @@ struct Subscribe
  */
 struct Unsubscribe
 {
-    const ProtocolVersion protocolVersion;
-    uint16_t packetId;
     std::string topic;
-    std::shared_ptr<Mqtt5PropertyBuilder> propertyBuilder;
 
-    Unsubscribe(const ProtocolVersion protocolVersion, uint16_t packetId, const std::string &topic);
-    size_t getLengthWithoutFixedHeader() const;
+    Unsubscribe(const std::string &topic);
 };
 
 enum class PacketDropReason

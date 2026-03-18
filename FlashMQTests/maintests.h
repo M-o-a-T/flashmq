@@ -137,8 +137,10 @@ class MainTests
     void testOverrideWillDelayOnSessionDestructionByTakeOver();
     void testDisabledWills();
     void testMqtt5DelayedWillsDisabled();
+
     void testStringDistances();
     void testConfigSuggestion();
+    void testFlags();
 
 
     void testIncomingTopicAlias();
@@ -157,6 +159,7 @@ class MainTests
 
     void testExpiredQueuedMessages();
     void testQoSPublishQueue();
+    void testQoSPublishQueueMemoryLeak();
 
     void testTimePointToAge();
 
@@ -210,6 +213,7 @@ class MainTests
     void testAlsoDontApproveOnErrorInPluginWithWildcardDenyMode();
     void testDenyWildcardSubscription();
     void testUserPropertiesPresent();
+    void testPublishInThread();
 
     void testPublishToItself();
     void testNoLocalPublishToItself();
@@ -240,6 +244,7 @@ class MainTests
 
     void forkingTestSaveAndLoadDelayedWill();
 
+    void testBase64();
     void testNoCopy();
     void testSessionTakeoverOtherUsername();
     void testCorrelationData();
@@ -262,7 +267,7 @@ class MainTests
 public:
     MainTests();
 
-    bool test(bool skip_tests_with_internet, bool skip_server_tests, const std::vector<std::string> &tests);
+    bool test(bool skip_tests_with_internet, bool skip_server_tests, bool abort_on_first_fail, const std::vector<std::string> &tests);
 };
 
 #endif // MAINTESTS_H

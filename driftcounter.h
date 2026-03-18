@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <array>
+#include <optional>
 
 /**
  * @brief The DriftCounter class allows measuring drift in threads.
@@ -12,9 +13,9 @@
  */
 class DriftCounter
 {
-    std::chrono::time_point<std::chrono::steady_clock> last_update = std::chrono::steady_clock::now();
+    std::optional<std::chrono::time_point<std::chrono::steady_clock>> last_update;
     std::chrono::milliseconds last_drift = std::chrono::milliseconds(0);
-    std::array<std::chrono::milliseconds, 16> many_drifts;
+    std::array<std::chrono::milliseconds, 16> many_drifts{};
     unsigned int many_index = 0;
 
 public:

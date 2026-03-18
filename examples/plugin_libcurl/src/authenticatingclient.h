@@ -26,22 +26,32 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 */
 
-#ifndef PLUGINSTATE_H
-#define PLUGINSTATE_H
+#ifndef AUTHENTICATINGCLIENT_H
+#define AUTHENTICATINGCLIENT_H
 
+#include <memory>
+#include <vector>
+
+#include "vendor/flashmq_plugin.h"
 #include <curl/curl.h>
-#include <stdint.h>
 
-
-struct PluginState
+// Use a name space to avoid obscure bugs when using type names FlashMQ uses too.
+namespace ExampleCurlPlugin
 {
-    CURLM *curlMulti = nullptr;
-    uint32_t current_timer = 0;
 
-    PluginState();
-    ~PluginState();
+struct AuthenticatingClient
+{
+    std::weak_ptr<Client> client;
+    std::vector<char> response;
+    std::unique_ptr<CURL, void(*)(CURL*)> easy_handle;
+    std::weak_ptr<CURLM> registeredAtMultiHandle;
 
+    AuthenticatingClient();
+    ~AuthenticatingClient();
+
+    void addToMulti(std::shared_ptr<CURLM> &curlMulti);
 };
 
+}
 
-#endif // PLUGINSTATE_H
+#endif // AUTHENTICATINGCLIENT_H

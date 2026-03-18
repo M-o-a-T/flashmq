@@ -15,7 +15,6 @@ See LICENSE for license details.
 #include <sys/time.h>
 #include <sys/statvfs.h>
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <signal.h>
 #include <iomanip>
@@ -35,6 +34,8 @@ See LICENSE for license details.
 #include "sslctxmanager.h"
 #include "logger.h"
 #include "evpencodectxmanager.h"
+#include "settings.h"
+#include "threadglobals.h"
 
 
 std::list<std::string> split(const std::string &input, const char sep, size_t max, bool keep_empty_parts)
@@ -140,9 +141,13 @@ bool containsDangerousCharacters(const std::string &s)
 
 std::vector<std::string> splitTopic(const std::string &topic)
 {
+    const Settings *settings = ThreadGlobals::getSettings();
+    const size_t limit{settings ? settings->maxTopicSplitDepth : std::numeric_limits<uint16_t>::max()};
+    assert(limit > 0);
+
 #ifdef __SSE4_2__
     thread_local static SimdUtils simdUtils;
-    return simdUtils.splitTopic(topic);
+    const std::vector<std::string> output = simdUtils.splitTopic(topic);
 #else
     std::vector<std::string> output;
     output.reserve(16);
@@ -154,9 +159,12 @@ std::vector<std::string> splitTopic(const std::string &topic)
         output.emplace_back(start, sep_pos);
         start = sep_pos + 1;
     } while (sep_pos != topic.end());
+#endif
+
+    if (output.size() > limit)
+        throw std::runtime_error("Topic/filter contains more components than 'max_topic_split_depth'");
 
     return output;
-#endif
 }
 
 std::vector<std::string> splitToVector(const std::string &input, const char sep, size_t max, bool keep_empty_parts)
@@ -285,7 +293,7 @@ bool isPowerOfTwo(int n)
     return (n != 0) && (n & (n - 1)) == 0;
 }
 
-std::vector<char> base64Decode(const std::string &s)
+std::vector<unsigned char> base64Decode(const std::string &s)
 {
     if (s.length() % 4 != 0)
         throw std::runtime_error("Decoding invalid base64 string");
@@ -293,33 +301,32 @@ std::vector<char> base64Decode(const std::string &s)
     if (s.empty())
         throw std::runtime_error("Trying to base64 decode an empty string.");
 
-    std::vector<char> tmp(s.size());
+    const std::vector<unsigned char> input(s.begin(), s.end());
+    std::vector<unsigned char> tmp(input.size() + 16);
 
     int outl = 0;
     int outl_total = 0;
 
     EvpEncodeCtxManager b64_ctx;
-    if (EVP_DecodeUpdate(b64_ctx.ctx, reinterpret_cast<unsigned char*>(tmp.data()), &outl, reinterpret_cast<const unsigned char*>(s.c_str()), s.size()) < 0)
+    if (EVP_DecodeUpdate(b64_ctx.ctx.get(), tmp.data(), &outl, input.data(), input.size()) < 0)
         throw std::runtime_error("Failure in EVP_DecodeUpdate()");
     outl_total += outl;
-    if (EVP_DecodeFinal(b64_ctx.ctx, reinterpret_cast<unsigned char*>(tmp[outl_total]), &outl) < 0)
+    if (EVP_DecodeFinal(b64_ctx.ctx.get(), tmp.data() + outl_total, &outl) < 0)
         throw std::runtime_error("Failure in EVP_DecodeFinal()");
-    std::vector<char> result(outl_total);
-    std::memcpy(result.data(), tmp.data(), outl_total);
+    std::vector<unsigned char> result = make_vector<unsigned char>(tmp, 0, outl_total);
     return result;
 }
 
 std::string base64Encode(const unsigned char *input, const int length)
 {
     const int pl = 4*((length+2)/3);
-    char *output = reinterpret_cast<char *>(calloc(pl+1, 1));
-    const int ol = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(output), input, length);
-    std::string result(output);
-    free(output);
+    std::vector<unsigned char> output(pl + 1);
+    const int ol = EVP_EncodeBlock(output.data(), input, length);
 
     if (pl != ol)
         throw std::runtime_error("Base64 encode error.");
 
+    std::string result = make_string(output, 0, ol);
     return result;
 }
 

@@ -17,6 +17,7 @@ See LICENSE for license details.
 #include "subscriptionstore.h"
 #include "globals.h"
 #include "utils.h"
+#include "mainapp.h"
 
 void flashmq_logf(int level, const char *str, ...)
 {
@@ -25,6 +26,15 @@ void flashmq_logf(int level, const char *str, ...)
     va_list valist;
     va_start(valist, str);
     logger->logf(level, str, valist);
+    va_end(valist);
+}
+
+void mosquitto_log_printf(int level, const char *fmt, ...)
+{
+    Logger *logger = Logger::getInstance();
+    va_list valist;
+    va_start(valist, fmt);
+    logger->logf(level, fmt, valist);
     va_end(valist);
 }
 
@@ -134,6 +144,12 @@ bool flashmq_plugin_add_subscription(
 
 void flashmq_continue_async_authentication(const std::weak_ptr<Client> &client, AuthResult result, const std::string &authMethod, const std::string &returnData)
 {
+    flashmq_continue_async_authentication_v4(client, result, authMethod, returnData, 0);
+}
+
+void flashmq_continue_async_authentication_v4(
+    const std::weak_ptr<Client> &client, AuthResult result, const std::string &authMethod, const std::string &returnData, const uint32_t delay_in_ms)
+{
     std::shared_ptr<Client> c = client.lock();
 
     if (!c)
@@ -144,56 +160,44 @@ void flashmq_continue_async_authentication(const std::weak_ptr<Client> &client, 
     if (!td)
         return;
 
-    td->queueContinuationOfAuthentication(c, result, authMethod, returnData);
+    td->queueContinuationOfAuthentication(c, result, authMethod, returnData, delay_in_ms);
+
 }
 
 void flashmq_publish_message(const std::string &topic, const uint8_t qos, const bool retain, const std::string &payload, uint32_t expiryInterval,
                              const std::vector<std::pair<std::string, std::string>> *userProperties,
                              const std::string *responseTopic, const std::string *correlationData, const std::string *contentType)
 {
-    Publish pub(topic, payload, qos);
-    pub.retain = retain;
+    auto do_publish = [](Publish &pub){
+        std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
 
-    if (userProperties)
-    {
-        for (const std::pair<std::string, std::string> &pair : *userProperties)
+        if (pub.retain)
         {
-            pub.addUserProperty(pair.first, pair.second);
+            store->setRetainedMessage(pub, pub.getSubtopics());
         }
-    }
 
-    if (expiryInterval)
+        PublishCopyFactory factory(&pub);
+        store->queuePacketAtSubscribers(factory, "", {});
+    };
+
+    auto f2 = [do_publish](std::shared_ptr<Publish> &pub){
+        do_publish(*pub);
+    };
+
+    auto &td_local = ThreadGlobals::getThreadData();
+
+    if (td_local)
     {
-        pub.setExpireAfter(expiryInterval);
+        Publish pub(topic, payload, qos, retain, expiryInterval, userProperties, responseTopic, correlationData, contentType);
+        do_publish(pub);
+        return;
     }
 
-    if (responseTopic)
-    {
-        pub.responseTopic = *responseTopic;
-    }
-
-    if (correlationData)
-    {
-        pub.correlationData = *correlationData;
-    }
-
-    if (contentType)
-    {
-        pub.contentType = *contentType;
-    }
-
-    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
-
-    if (pub.retain)
-    {
-        store->setRetainedMessage(pub, pub.getSubtopics());
-    }
-
-    PublishCopyFactory factory(&pub);
-    store->queuePacketAtSubscribers(factory, "", {});
+    std::shared_ptr<Publish> pub = std::make_shared<Publish>(topic, payload, qos, retain, expiryInterval, userProperties, responseTopic, correlationData, contentType);
+    auto td = globals->getDeterministicThreadData();
+    auto f_bound = std::bind(f2, std::move(pub));
+    td->addImmediateTask(f_bound);
 }
-
-
 
 void flashmq_get_client_address(const std::weak_ptr<Client> &client, std::string *text, FlashMQSockAddr *addr)
 {
@@ -244,7 +248,7 @@ void flashmq_get_client_address_v4(const std::weak_ptr<Client> &client, std::str
 
 void flashmq_poll_add_fd(int fd, uint32_t events, const std::weak_ptr<void> &p)
 {
-    ThreadData *d = ThreadGlobals::getThreadData().get();
+    auto &d = ThreadGlobals::getThreadData();
 
     if (!d)
         return;
@@ -254,7 +258,7 @@ void flashmq_poll_add_fd(int fd, uint32_t events, const std::weak_ptr<void> &p)
 
 void flashmq_poll_remove_fd(uint32_t fd)
 {
-    ThreadData *d = ThreadGlobals::getThreadData().get();
+    auto &d = ThreadGlobals::getThreadData();
 
     if (!d)
         return;
@@ -274,7 +278,7 @@ constexpr int FlashMQSockAddr::getLen()
 
 uint32_t flashmq_add_task(std::function<void ()> f, uint32_t delay_in_ms)
 {
-    std::shared_ptr<ThreadData> d = ThreadGlobals::getThreadData();
+    auto d = ThreadGlobals::getThreadData();
 
     if (!d)
         throw std::runtime_error("No thread data?");
@@ -284,7 +288,7 @@ uint32_t flashmq_add_task(std::function<void ()> f, uint32_t delay_in_ms)
 
 void flashmq_remove_task(uint32_t id)
 {
-    std::shared_ptr<ThreadData> d = ThreadGlobals::getThreadData();
+    auto d = ThreadGlobals::getThreadData();
 
     if (!d)
         return;
@@ -307,4 +311,38 @@ void flashmq_get_client_pointer(const std::weak_ptr<Session> &session, std::weak
     std::shared_ptr<Session> sessionLocked = session.lock();
     if (!sessionLocked) return;
     clientOut = sessionLocked->makeSharedClient();
+}
+
+void flashmq_defer_thread_ready()
+{
+    auto d = ThreadGlobals::getThreadData();
+
+    if (!d)
+    {
+        Logger::getInstance()->log(LOG_ERROR) << "Calling flashmq_defer_thread_ready from custom thread.";
+        return;
+    }
+
+    d->deferThreadReady = true;
+}
+
+void flashmq_signal_thread_ready()
+{
+    const auto d = ThreadGlobals::getThreadData();
+
+    if (!d)
+    {
+        Logger::getInstance()->log(LOG_ERROR) << "Calling flashmq_signal_thread_ready from custom thread.";
+        return;
+    }
+
+    if (!d->deferThreadReady)
+        return;
+
+    std::shared_ptr<MainApp> lockedMainApp = d->mMainApp.lock();
+
+    if (!lockedMainApp)
+        return;
+
+    lockedMainApp->queueThreadInitDecrement();
 }

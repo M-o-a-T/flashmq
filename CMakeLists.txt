@@ -3,7 +3,7 @@ cmake_policy(SET CMP0048 NEW)
 include(CheckCXXCompilerFlag)
 include(CMakeLists.shared)
 
-project(FlashMQ VERSION 1.23.2 LANGUAGES CXX)
+project(FlashMQ VERSION 1.26.0 LANGUAGES CXX)
 
 add_definitions(-DOPENSSL_API_COMPAT=0x10100000L)
 add_definitions(-DFLASHMQ_VERSION=\"${PROJECT_VERSION}\")
@@ -14,7 +14,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if (FMQ_ASAN)
     message("Building with ASAN.")
     add_compile_options(-fsanitize=address)
-    set(ASAN_LIB asan)
+    add_link_options(-fsanitize=address)
 endif()
 
 check_cxx_compiler_flag("-msse4.2"   COMPILER_RT_HAS_MSSE4_2_FLAG)
@@ -22,13 +22,10 @@ if (${COMPILER_RT_HAS_MSSE4_2_FLAG})
     SET(CMAKE_CXX_FLAGS "-msse4.2")
 endif()
 
-check_cxx_compiler_flag("-rdynamic" COMPILER_SUPPORTS_RDYNAMIC)
-if (${COMPILER_SUPPORTS_RDYNAMIC})
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rdynamic")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
-endif()
+add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden)
+add_link_options(-rdynamic)
 
-add_compile_options(-Wall)
+add_compile_options(-Wall -Wextra)
 
 add_executable(flashmq
     ${FLASHMQ_HEADERS}
@@ -37,7 +34,7 @@ add_executable(flashmq
     main.cpp
     )
 
-target_link_libraries(flashmq ${ASAN_LIB} pthread dl ssl crypto resolv anl)
+target_link_libraries(flashmq pthread dl ssl crypto resolv anl)
 
 execute_process(COMMAND ../.get-os-codename-and-stamp.sh OUTPUT_VARIABLE OS_CODENAME)
 

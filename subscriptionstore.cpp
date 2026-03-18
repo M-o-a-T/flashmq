@@ -491,7 +491,8 @@ void SubscriptionStore::queueWillMessage(const std::shared_ptr<WillPublish> &wil
     if (!willMessage)
         return;
 
-    logger->log(LOG_DEBUG) << "Queueing will on topic '" << willMessage->topic << "', with delay of " << willMessage->will_delay << " seconds.";
+    if (logger->wouldLog(LOG_DEBUG))
+        logger->log(LOG_DEBUG) << "Queueing will on topic '" << willMessage->topic << "', with delay of " << willMessage->will_delay << " seconds.";
 
     willMessage->setQueuedAt();
 
@@ -858,7 +859,7 @@ void SubscriptionStore::giveClientRetainedMessagesInitiateDeferred(const std::we
 
     if (!deferred->empty() && ++requeue_count < 100 && total_node_count < settings->retainedMessagesNodeLimit)
     {
-        ThreadData *t = ThreadGlobals::getThreadData().get();
+        auto &t = ThreadGlobals::getThreadData();
         auto again = std::bind(&SubscriptionStore::giveClientRetainedMessagesInitiateDeferred, this,
                                ses, subscribeSubtopicsCopy, deferred, requeue_count, total_node_count, max_qos, subscription_identifier);
 
@@ -924,7 +925,7 @@ void SubscriptionStore::trySetRetainedMessages(const Publish &publish, const std
     const Settings *settings = ThreadGlobals::getSettings();
     const bool try_lock_fail = settings->setRetainedMessageDeferTimeout.count() != 0;
 
-    ThreadData *td = ThreadGlobals::getThreadData().get();
+    auto &td = ThreadGlobals::getThreadData();
 
     if (!td)
         return;
@@ -1091,7 +1092,8 @@ int SubscriptionNode::cleanSubscriptions(std::deque<std::weak_ptr<SubscriptionNo
 
         if (n == 0)
         {
-            Logger::getInstance()->logf(LOG_DEBUG, "Resetting wildcard children");
+            if (Logger::getInstance()->wouldLog(LOG_DEBUG))
+                Logger::getInstance()->logf(LOG_DEBUG, "Resetting wildcard children");
             node_.reset();
         }
     }
@@ -1106,7 +1108,8 @@ int SubscriptionNode::cleanSubscriptions(std::deque<std::weak_ptr<SubscriptionNo
 
             if (cur_it->second.session.expired())
             {
-                Logger::getInstance()->logf(LOG_DEBUG, "Removing empty spot in subscribers map");
+                if (Logger::getInstance()->wouldLog(LOG_DEBUG))
+                    Logger::getInstance()->logf(LOG_DEBUG, "Removing empty spot in subscribers map");
                 subscribers.erase(cur_it);
             }
         }
@@ -1146,7 +1149,8 @@ void SubscriptionStore::removeSession(const std::shared_ptr<Session> &session)
         return;
 
     const std::string &clientid = session->getClientId();
-    logger->log(LOG_DEBUG) << "Removing session of client '" << clientid << "', if it matches the object.";
+    if (logger->wouldLog(LOG_DEBUG))
+        logger->log(LOG_DEBUG) << "Removing session of client '" << clientid << "', if it matches the object.";
 
     std::list<std::shared_ptr<Session>> sessionsToRemove;
 
@@ -1387,7 +1391,7 @@ void SubscriptionStore::getRetainedMessages(
     {
         std::lock_guard<std::mutex> locker(this_node->messageSetMutex);
         if (this_node->message)
-            outputList.push_back(*this_node->message);
+            outputList.emplace_back(*this_node->message);
     }
 
     for(auto &pair : this_node->children)
@@ -1706,15 +1710,12 @@ void SubscriptionStore::loadSessionsAndSubscriptions(const std::string &filePath
 
             for (const SubscriptionForSerializing &sub : subs)
             {
-                std::shared_ptr<SubscriptionNode> subscriptionNode = getDeepestNode(splitTopic(topic));
-
                 auto session_it = sessionsByIdConst.find(sub.clientId);
-                if (session_it != sessionsByIdConst.end())
-                {
-                    const std::shared_ptr<Session> &ses = session_it->second;
-                    subscriptionNode->addSubscriber(ses, sub.qos, sub.noLocal, sub.retainAsPublished, sub.shareName, sub.subscriptionidentifier);
-                }
 
+                if (session_it == sessionsByIdConst.end())
+                    continue;
+
+                addSubscription(session_it->second, splitTopic(topic), sub.qos, sub.noLocal, sub.retainAsPublished, sub.shareName, sub.subscriptionidentifier);
             }
         }
     }
@@ -1741,8 +1742,15 @@ ssize_t RetainedMessageNode::addPayload(const Publish &publish)
         return result;
     }
 
-    RetainedMessage rm(publish);
-    message = std::make_unique<RetainedMessage>(std::move(rm));
+    if (message)
+    {
+        (*message) = publish;
+    }
+    else
+    {
+        message = std::make_unique<RetainedMessage>(publish);
+    }
+
     result++;
     messageSetAt = std::chrono::steady_clock::now();
     return result;

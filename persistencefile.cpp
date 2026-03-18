@@ -25,7 +25,7 @@ See LICENSE for license details.
 #include "logger.h"
 
 PersistenceFile::PersistenceFile(const std::string &filePath) :
-    digestContext(EVP_MD_CTX_new()),
+    digestContext(EVP_MD_CTX_new(), EVP_MD_CTX_free),
     buf(1024*1024)
 {
     if (!filePath.empty() && filePath[filePath.size() - 1] == '/')
@@ -56,9 +56,6 @@ PersistenceFile::~PersistenceFile()
         fclose(f); // fclose was already attempted and error handled if it was possible. In case an early fault happend, we need to still make sure.
         f = nullptr;
     }
-
-    EVP_MD_CTX_free(digestContext);
-    digestContext = nullptr;
 }
 
 /**
@@ -98,16 +95,16 @@ void PersistenceFile::hashFile()
     unsigned char md_value[EVP_MAX_MD_SIZE];
     std::memset(md_value, 0, EVP_MAX_MD_SIZE);
 
-    EVP_MD_CTX_reset(digestContext);
-    EVP_DigestInit_ex(digestContext, sha512, NULL);
+    EVP_MD_CTX_reset(digestContext.get());
+    EVP_DigestInit_ex(digestContext.get(), sha512, NULL);
 
     while (!feof(f))
     {
         size_t n = fread(buf.data(), 1, buf.size(), f);
-        EVP_DigestUpdate(digestContext, buf.data(), n);
+        EVP_DigestUpdate(digestContext.get(), buf.data(), n);
     }
 
-    EVP_DigestFinal_ex(digestContext, md_value, &output_len);
+    EVP_DigestFinal_ex(digestContext.get(), md_value, &output_len);
 
     if (output_len != HASH_SIZE)
         throw std::runtime_error("Impossible: calculated hash size wrong length");
@@ -135,16 +132,16 @@ void PersistenceFile::verifyHash()
     unsigned char md_value[EVP_MAX_MD_SIZE];
     std::memset(md_value, 0, EVP_MAX_MD_SIZE);
 
-    EVP_MD_CTX_reset(digestContext);
-    EVP_DigestInit_ex(digestContext, sha512, NULL);
+    EVP_MD_CTX_reset(digestContext.get());
+    EVP_DigestInit_ex(digestContext.get(), sha512, NULL);
 
     while (!feof(f))
     {
         size_t n = fread(buf.data(), 1, buf.size(), f);
-        EVP_DigestUpdate(digestContext, buf.data(), n);
+        EVP_DigestUpdate(digestContext.get(), buf.data(), n);
     }
 
-    EVP_DigestFinal_ex(digestContext, md_value, &output_len);
+    EVP_DigestFinal_ex(digestContext.get(), md_value, &output_len);
 
     if (output_len != HASH_SIZE)
         throw std::runtime_error("Impossible: calculated hash size wrong length");
@@ -256,7 +253,7 @@ int64_t PersistenceFile::readInt64(bool &eofFound)
     if (readCheck(buf.data(), 1, 8, f) < 0)
         eofFound = true;
 
-    unsigned char *buf_ = reinterpret_cast<unsigned char *>(buf.data());
+    unsigned char *buf_ = buf.data();
     const uint64_t val1 = ((buf_[0]) << 24) | ((buf_[1]) << 16) | ((buf_[2]) << 8) | (buf_[3]);
     const uint64_t val2 = ((buf_[4]) << 24) | ((buf_[5]) << 16) | ((buf_[6]) << 8) | (buf_[7]);
     const int64_t val = (val1 << 32) | val2;
@@ -269,7 +266,7 @@ uint32_t PersistenceFile::readUint32(bool &eofFound)
         eofFound = true;
 
     uint32_t val;
-    unsigned char *buf_ = reinterpret_cast<unsigned char *>(buf.data());
+    unsigned char *buf_ = buf.data();
     val = ((buf_[0]) << 24) | ((buf_[1]) << 16) | ((buf_[2]) << 8) | (buf_[3]);
     return val;
 }
@@ -280,7 +277,7 @@ uint16_t PersistenceFile::readUint16(bool &eofFound)
         eofFound = true;
 
     uint16_t val;
-    unsigned char *buf_ = reinterpret_cast<unsigned char *>(buf.data());
+    unsigned char *buf_ = buf.data();
     val = ((buf_[0]) << 8) | (buf_[1]);
     return val;
 }
@@ -304,7 +301,7 @@ std::string PersistenceFile::readString(bool &eofFound)
 
     makeSureBufSize(size);
     readCheck(buf.data(), 1, size, f);
-    std::string result(buf.data(), size);
+    std::string result = make_string(buf, 0, size);
     return result;
 }
 
@@ -324,8 +321,16 @@ std::optional<std::string> PersistenceFile::readOptionalString(bool &eofFound)
  */
 void PersistenceFile::openWrite(const std::string &versionString)
 {
+    if (versionString.size() - 1 >= MAGIC_STRING_LENGH)
+        throw std::runtime_error("Version string length must be shorter than " + std::to_string(MAGIC_STRING_LENGH));
+
     if (openMode != FileMode::unknown)
         throw std::runtime_error("File is already open.");
+
+    int fd = creat(filePathTemp.c_str(), S_IRUSR | S_IWUSR);
+    if (fd < 0)
+        throw std::runtime_error("Creating " + filePathTemp + " failed");
+    close(fd);
 
     f = fopen(filePathTemp.c_str(), "w+b");
 
@@ -333,8 +338,6 @@ void PersistenceFile::openWrite(const std::string &versionString)
     {
         throw std::runtime_error(formatString("Can't open '%s': %s", filePathTemp.c_str(), strerror(errno)));
     }
-
-    chmod(filePathTemp.c_str(), S_IRUSR | S_IWUSR);
 
     openMode = FileMode::write;
 
@@ -361,7 +364,12 @@ void PersistenceFile::openRead(const std::string &expected_version_string)
     rewind(f);
 
     readCheck(buf.data(), 1, MAGIC_STRING_LENGH, f);
-    detectedVersionString = std::string(buf.data(), strlen(buf.data()));
+    const auto magic_string_0_pos = std::find(buf.begin(), buf.end(), 0);
+
+    if (magic_string_0_pos == buf.end())
+        throw std::runtime_error("Error reading version string.");
+
+    detectedVersionString = std::string(buf.begin(), magic_string_0_pos);
 
     // In case people want to downgrade, the old file is still there.
     if (detectedVersionString != expected_version_string)
@@ -377,6 +385,12 @@ void PersistenceFile::openRead(const std::string &expected_version_string)
             {
                 logger->log(LOG_NOTICE) << "File version change detected. Copying '" << filePath << "' to '"
                                         << copy_file_path << "' to support downgrading FlashMQ.";
+
+                int fd = creat(copy_file_path.c_str(), S_IRUSR | S_IWUSR);
+                if (fd < 0)
+                    throw std::runtime_error("Creating " + copy_file_path + " failed");
+                close(fd);
+
                 std::ifstream  src(filePath, std::ios::binary);
                 std::ofstream  dst(copy_file_path, std::ios::binary);
                 src.exceptions(std::ifstream::failbit | std::ifstream::badbit);
@@ -446,8 +460,11 @@ void PersistenceFile::closeFile()
                 throw std::runtime_error(formatString("Saving '%s' failed: rename of temp file to target failed with: %s", filePath.c_str(), strerror(errno)));
 
             int dir_fd = open(this->dirPath.c_str(), O_RDONLY);
-            fsync(dir_fd);
-            close(dir_fd);
+            if (dir_fd > 0)
+            {
+                fsync(dir_fd);
+                close(dir_fd);
+            }
         }
     }
 }

@@ -14,7 +14,6 @@ See LICENSE for license details.
 #include <unistd.h>
 #include <memory>
 #include <vector>
-#include <exception>
 
 #include "forward_declarations.h"
 
@@ -25,6 +24,7 @@ See LICENSE for license details.
 #include "variablebyteint.h"
 #include "mqtt5properties.h"
 #include "packetdatatypes.h"
+#include "exceptions.h"
 
 enum class HandleResult
 {
@@ -63,12 +63,21 @@ class MqttPacket
 
     Logger *logger = Logger::getInstance();
 
-    char *readBytes(size_t length);
+    std::string_view readBytes(size_t length);
     char readByte();
     uint8_t readUint8();
     void writeByte(char b);
     void writeUint16(uint16_t x);
-    void writeBytes(const char *b, size_t len);
+
+    template<typename T>
+    void write(T &src)
+    {
+        if (pos + src.size() > bites.size())
+            throw ProtocolError("Exceeding packet size", ReasonCodes::MalformedPacket);
+
+        std::copy(src.begin(), src.end(), bites.begin() + pos);
+        pos += src.size();
+    }
 
     template<typename T>
     void writeProperties(T properties)
@@ -90,7 +99,9 @@ class MqttPacket
     uint32_t readFourBytesToUint32();
     size_t remainingAfterPos();
     size_t decodeVariableByteIntAtPos();
-    std::string readBytesToString(bool validateUtf8 = true, bool alsoCheckInvalidPublishChars = false);
+    std::string readBytesToString(
+        const uint16_t maxLength = std::numeric_limits<uint16_t>::max(), bool validateUtf8 = true, bool alsoCheckInvalidPublishChars = false,
+        const ReasonCodes reasonCode = ReasonCodes::MalformedPacket);
 
     void calculateRemainingLength();
     void setPosToDataStart();
@@ -121,8 +132,8 @@ public:
     MqttPacket(const Disconnect &disconnect);
     MqttPacket(const Auth &auth);
     MqttPacket(const Connect &connect);
-    MqttPacket(const Subscribe &subscribe);
-    MqttPacket(const Unsubscribe &unsubscribe);
+    MqttPacket(const ProtocolVersion protocolVersion, const uint16_t packetId, const uint32_t subscriptionIdentifier, const std::vector<Subscribe> &subscriptions);
+    MqttPacket(const ProtocolVersion protocolVersion, const uint16_t packetId, const std::vector<Unsubscribe> &unsubs);
 
     static void bufferToMqttPackets(CirBuf &buf, std::vector<MqttPacket> &packetQueueIn, std::shared_ptr<Client> &sender);
 
@@ -172,6 +183,8 @@ public:
     std::vector<std::pair<std::string, std::string>> *getUserProperties() const;
     const std::optional<std::string> &getCorrelationData() const;
     const std::optional<std::string> &getResponseTopic() const;
+    const std::optional<std::string> &getContentType() const;
+    const std::optional<std::chrono::time_point<std::chrono::steady_clock>> getExpiresAt() const;
 };
 
 struct SubscriptionTuple

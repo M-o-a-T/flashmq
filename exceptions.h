@@ -11,11 +11,17 @@ See LICENSE for license details.
 #ifndef EXCEPTIONS_H
 #define EXCEPTIONS_H
 
-#include <exception>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 
 #include "types.h"
+
+#define API __attribute__((visibility("default")))
+
+// Because exceptions are (potentially) visible to plugins, we want to make sure to avoid symbol collisions, so using their own namespace.
+namespace FlashMQ
+{
 
 /**
  * @brief The ProtocolError class is handled by the error handler in the worker threads and is used to make decisions about if and how
@@ -23,7 +29,7 @@ See LICENSE for license details.
  *
  * It's mainly meant for errors that can be communicated with MQTT packets.
  */
-class ProtocolError : public std::runtime_error
+class API ProtocolError : public std::runtime_error
 {
 public:
     const ReasonCodes reasonCode;
@@ -35,47 +41,60 @@ public:
     }
 };
 
-class BadClientException : public std::runtime_error
+class API BadClientException : public std::runtime_error
 {
+    std::optional<int> mLogLevel;
+
 public:
-    BadClientException(const std::string &msg) : std::runtime_error(msg) {}
+    BadClientException(const std::string &msg, int logLevel=-1) : std::runtime_error(msg)
+    {
+        if (logLevel >= 0)
+            this->mLogLevel = logLevel;
+    }
+
+    std::optional<int> getLogLevel() const { return this->mLogLevel; }
+
 };
 
-class NotImplementedException : public std::runtime_error
+class API NotImplementedException : public std::runtime_error
 {
 public:
     NotImplementedException(const std::string &msg) : std::runtime_error(msg) {}
 };
 
-class FatalError : public std::runtime_error
+class API FatalError : public std::runtime_error
 {
 public:
     FatalError(const std::string &msg) : std::runtime_error(msg) {}
 };
 
-class ConfigFileException : public std::runtime_error
+class API ConfigFileException : public std::runtime_error
 {
 public:
     ConfigFileException(const std::string &msg) : std::runtime_error(msg) {}
     ConfigFileException(std::ostringstream oss) : std::runtime_error(oss.str()) {}
 };
 
-class pluginException : public std::runtime_error
+class API pluginException : public std::runtime_error
 {
 public:
     pluginException(const std::string &msg) : std::runtime_error(msg) {}
 };
 
-class BadWebsocketVersionException : public std::runtime_error
+class API BadWebsocketVersionException : public std::runtime_error
 {
 public:
     BadWebsocketVersionException(const std::string &msg) : std::runtime_error(msg) {}
 };
 
-class BadHttpRequest : public std::runtime_error
+class API BadHttpRequest : public std::runtime_error
 {
 public:
     BadHttpRequest(const std::string &msg) : std::runtime_error(msg) {}
 };
+
+}
+
+using namespace FlashMQ;
 
 #endif // EXCEPTIONS_H

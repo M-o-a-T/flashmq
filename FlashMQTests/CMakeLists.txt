@@ -19,10 +19,10 @@ else()
     SET(CMAKE_CXX_FLAGS "-msse4.2")
 endif()
 
-set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -rdynamic")
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+add_link_options(-rdynamic)
 
-add_compile_options(-Wall -fsanitize=address)
+add_compile_options(-Wall -Wextra -fsanitize=address)
+add_link_options(-fsanitize=address)
 
 add_library(test_plugin SHARED
     plugins/test_plugin.h plugins/test_plugin.cpp
@@ -69,9 +69,12 @@ add_executable(flashmq-tests
 
     )
 
+target_compile_options(flashmq-tests PUBLIC -fvisibility=hidden -fvisibility-inlines-hidden)
+target_link_options(flashmq-tests PUBLIC -rdynamic)
+
 target_include_directories(flashmq-tests PUBLIC ..)
 
-target_link_libraries(flashmq-tests asan pthread dl ssl crypto resolv anl)
+target_link_libraries(flashmq-tests pthread dl ssl crypto resolv anl)
 
 
 

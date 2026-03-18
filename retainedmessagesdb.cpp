@@ -14,7 +14,6 @@ See LICENSE for license details.
 #include <unistd.h>
 #include <exception>
 #include <stdexcept>
-#include <stdio.h>
 #include <cstring>
 #include <inttypes.h>
 
@@ -123,9 +122,12 @@ void RetainedMessagesDB::saveData(const std::vector<RetainedMessage> &messages)
 
     for (const RetainedMessage &rm : messages)
     {
-        logger->log(LOG_DEBUG)
-            << LOG_DEBUG << "Saving retained message for topic '" << rm.publish.topic << "' QoS " << static_cast<int>(rm.publish.qos)
-            << ", age " << rm.publish.getAge<std::chrono::seconds>().count() << " seconds.";
+        if (logger->wouldLog(LOG_DEBUG))
+        {
+            logger->log(LOG_DEBUG)
+                << "Saving retained message for topic '" << rm.publish.topic << "' QoS " << static_cast<int>(rm.publish.qos)
+                << ", age " << rm.publish.getAge<std::chrono::seconds>().count() << " seconds.";
+        }
 
         this->written_count++;
 
@@ -179,7 +181,7 @@ std::list<RetainedMessage> RetainedMessagesDB::readDataV3V4(size_t max)
 
     const Settings &settings = *ThreadGlobals::getSettings();
     std::shared_ptr<ThreadData> dummyThreadData;
-    std::shared_ptr<Client> dummyClient(std::make_shared<Client>(ClientType::Normal, 0, dummyThreadData, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> dummyClient(std::make_shared<Client>(ClientType::Normal, -1, dummyThreadData, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     dummyClient->setClientProperties(ProtocolVersion::Mqtt5, "Dummyforloadingretained", {}, "nobody", true, 60);
 
     bool eofFound = false;
@@ -223,9 +225,12 @@ std::list<RetainedMessage> RetainedMessagesDB::readDataV3V4(size_t max)
             pub.expireInfo.value().createdAt = timepointFromAge(newPubAge);
 
         RetainedMessage msg(pub);
-        logger->log(LOG_DEBUG)
-            << LOG_DEBUG << "Loading retained message for topic '" << msg.publish.topic << "' QoS " << static_cast<int>(msg.publish.qos)
-            << ", age " << msg.publish.getAge<std::chrono::seconds>().count() << " seconds.";
+        if (logger->wouldLog(LOG_DEBUG))
+        {
+            logger->log(LOG_DEBUG)
+                << "Loading retained message for topic '" << msg.publish.topic << "' QoS " << static_cast<int>(msg.publish.qos)
+                << ", age " << msg.publish.getAge<std::chrono::seconds>().count() << " seconds.";
+        }
         messages.push_back(std::move(msg));
     }
 

@@ -23,9 +23,7 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
     ThreadGlobals::assignThreadData(threadData);
     ThreadGlobals::assignSettings(&threadData->settingsLocalCopy);
 
-    struct epoll_event events[MAX_EVENTS];
-    memset(&events, 0, sizeof (struct epoll_event)*MAX_EVENTS);
-
+    std::vector<epoll_event> events(MAX_EVENTS);
     std::vector<MqttPacket> packetQueueIn;
 
     Logger *logger = Logger::getInstance();
@@ -37,12 +35,24 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
         logger->logf(LOG_NOTICE, "Thread %d doing auth init.", threadData->threadnr);
         threadData->initplugin();
         threadData->running = true;
+
+        auto lockedMainApp = threadData->mMainApp.lock();
+
+        if (!threadData->deferThreadReady && lockedMainApp)
+        {
+            lockedMainApp->queueThreadInitDecrement();
+        }
     }
     catch(std::exception &ex)
     {
         logger->logf(LOG_ERR, "Error initializing auth back-end: %s", ex.what());
-        MainApp *instance = MainApp::getMainApp();
-        instance->quit();
+
+        auto lockedMainApp = threadData->mMainApp.lock();
+
+        if (lockedMainApp)
+        {
+            lockedMainApp->quit();
+        }
     }
 
     std::vector<ReadyClient> ready_clients;
@@ -54,12 +64,14 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
         const uint32_t next_task_delay = threadData->delayedTasks.getTimeTillNext();
         const uint32_t epoll_wait_time = std::min<uint32_t>(next_task_delay, 100);
 
-        int fdcount = epoll_wait(epoll_fd, events, MAX_EVENTS, epoll_wait_time);
+        int fdcount = epoll_wait(epoll_fd, events.data(), events.size(), epoll_wait_time);
 
         if (__builtin_expect(epoll_wait_time == 0, 0))
         {
             threadData->delayedTasks.performAll();
         }
+
+        threadData->updateNrOfClients();
 
         if (fdcount < 0)
         {
@@ -74,30 +86,7 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
 
             if (fd == threadData->taskEventFd)
             {
-                uint64_t eventfd_value = 0;
-                if (read(fd, &eventfd_value, sizeof(uint64_t)) < 0)
-                    logger->log(LOG_ERROR) << "Error reading taskEventFd: " << strerror(errno);
-
-                std::list<std::function<void()>> copiedTasks;
-
-                {
-                    auto task_queue_locked = threadData->taskQueue.lock();
-                    copiedTasks = std::move(*task_queue_locked);
-                    task_queue_locked->clear();
-                }
-
-                for(auto &f : copiedTasks)
-                {
-                    try
-                    {
-                        f();
-                    }
-                    catch (std::exception &ex)
-                    {
-                        Logger *logger = Logger::getInstance();
-                        logger->logf(LOG_ERR, "Error in queued task: %s", ex.what());
-                    }
-                }
+                threadData->performAllImmediateTasks();
 
                 try
                 {
@@ -135,6 +124,11 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
                 threadData->disconnectingClients.clear();
                 threadData->queueQuit();
             }
+            else if (fd == threadData->acceptQueue.event_fd.get())
+            {
+                threadData->acceptQueue.readFd();
+                threadData->acceptPendingClients();
+            }
             else
             {
                 ready_clients.emplace_back(static_cast<uint32_t>(cur_ev.events), threadData->getClient(fd));
@@ -163,27 +157,22 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
 
             try
             {
-                if (__builtin_expect(client->needsHaProxyParsing(), 0))
+                if (client->getHaProxyStage() != HaProxyStage::DoneOrNotNeeded)
                 {
-                    if (client->readHaProxyData() == HaProxyConnectionType::Local)
+                    if (client->readHaProxyData() == HaProxyStage::DoneOrNotNeeded)
                     {
-                        client->setDisconnectReason("HAProxy health check");
+                        if (client->getHaProxyConnectionType() == HaProxyConnectionType::Local)
+                        {
+                            client->setDisconnectReason("HAProxy health check");
+                            threadData->removeClient(client);
+                        }
                     }
+
+                    continue;
                 }
                 if (client->isOutgoingConnection() && !client->getOutgoingConnectionEstablished())
                 {
-                    int error = 0;
-                    socklen_t optlen = sizeof(int);
-                    int rc = getsockopt(client->getFd(), SOL_SOCKET, SO_ERROR, &error, &optlen);
-
-                    if (rc == 0 && error == 0)
-                    {
-                        client->setBridgeConnected();
-                    }
-
-                    if (error > 0 && error != EINPROGRESS)
-                        throw std::runtime_error(strerror(error));
-
+                    client->detectOutgoingConnectionEstablished();
                     continue;
                 }
                 if (ready_client.events & EPOLLHUP)
@@ -192,13 +181,7 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
                 }
                 if (ready_client.events & EPOLLERR)
                 {
-                    int error = 0;
-                    socklen_t errlen = sizeof(error);
-                    if (getsockopt(client->getFd(), SOL_SOCKET, SO_ERROR, &error, &errlen) == 0)
-                    {
-                        client->setDisconnectReason(strerror(error));
-                    }
-
+                    client->setDisconnectReasonFromSocketError();
                     threadData->removeClient(client);
                     continue;
                 }
@@ -253,7 +236,9 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
             }
             catch (ProtocolError &ex)
             {
-                client->setDisconnectReason(ex.what());
+                std::string reason("Protocol error: ");
+                reason.append(ex.what());
+                client->setDisconnectReason(reason, LOG_WARNING);
                 bool clientRemoved = true;
 
                 try
@@ -292,24 +277,23 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
                 catch (std::exception &inner_ex)
                 {
                     clientRemoved = false;
-                    logger->log(LOG_ERR) << "Exception when notyfing client about ProtocolError: " << inner_ex.what();
+                    logger->log(LOG_ERROR) << "Exception when notyfing client about ProtocolError: " << inner_ex.what();
                 }
 
                 if (!clientRemoved)
                 {
-                    logger->log(LOG_ERR) << "Unspecified or non-MQTT protocol error: " << ex.what() << ". Removing client.";
                     threadData->removeClient(client);
                 }
             }
             catch(BadClientException &ex)
             {
-                client->setDisconnectReason(ex.what());
+                client->setDisconnectReason(ex.what(), ex.getLogLevel().value_or(-1));
                 threadData->removeClient(client);
             }
             catch(std::exception &ex)
             {
                 client->setDisconnectReason(ex.what());
-                logger->log(LOG_ERR) << "Packet read/write error: " << ex.what() << ". Removing client " << client->repr();
+                logger->log(LOG_ERR) << "Error handling client: " << ex.what() << ". Removing client " << client->repr();
                 threadData->removeClient(client);
             }
         }
@@ -319,6 +303,8 @@ void do_thread_work(std::shared_ptr<ThreadData> threadData)
     {
         logger->logf(LOG_NOTICE, "Thread %d doing auth cleanup.", threadData->threadnr);
         threadData->cleanupplugin();
+
+        threadData->deleteClients();
     }
     catch(std::exception &ex)
     {

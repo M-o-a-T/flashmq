@@ -18,6 +18,7 @@ See LICENSE for license details.
 #include <sys/stat.h>
 #include <optional>
 #include <sys/sysinfo.h>
+#include <stack>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -204,6 +205,7 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validKeys.insert("mqtt3_qos_exceed_action");
     validKeys.insert("log_debug");
     validKeys.insert("log_subscriptions");
+    validKeys.insert("log_publishes");
     validKeys.insert("log_level");
     validKeys.insert("mosquitto_password_file");
     validKeys.insert("mosquitto_acl_file");
@@ -229,6 +231,7 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validKeys.insert("include_dir");
     validKeys.insert("rebuild_subscription_tree_interval_seconds");
     validKeys.insert("minimum_wildcard_subscription_depth");
+    validKeys.insert("max_topic_split_depth");
     validKeys.insert("wildcard_subscription_deny_mode");
     validKeys.insert("zero_byte_username_is_anonymous");
     validKeys.insert("overload_mode");
@@ -238,6 +241,8 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validKeys.insert("save_state_interval");
     validKeys.insert("subscription_node_lifetime");
     validKeys.insert("subscription_identifiers_enabled");
+    validKeys.insert("persistence_data_to_save");
+    validKeys.insert("max_string_length");
 
     validListenKeys.insert("port");
     validListenKeys.insert("protocol");
@@ -365,7 +370,7 @@ void ConfigFileParser::loadFile(bool test)
     const std::list<std::string> unprocessed_lines = readFileRecursively(path);
     std::list<std::string> lines;
 
-    bool inBlock = false;
+    int blockDepth = 0;
     std::ostringstream oss;
     int linenr = 0;
 
@@ -392,12 +397,6 @@ void ConfigFileParser::loadFile(bool test)
         const bool blockStartMatch = std::regex_search(line, matches, block_regex_start);
         const bool blockEndMatch = std::regex_search(line, matches, block_regex_end);
 
-        if ((blockStartMatch && inBlock) || (blockEndMatch && !inBlock))
-        {
-            oss << "Unexpected block start or end at line " << linenr << ": " << line;
-            throw ConfigFileException(oss.str());
-        }
-
         if (!std::regex_search(line, matches, key_value_regex) && !blockStartMatch && !blockEndMatch)
         {
             oss << "Line '" << line << "' invalid";
@@ -405,26 +404,27 @@ void ConfigFileParser::loadFile(bool test)
         }
 
         if (blockStartMatch)
-            inBlock = true;
+            blockDepth++;
         if (blockEndMatch)
-            inBlock = false;
+            blockDepth--;
 
         lines.push_back(line);
     }
 
-    if (inBlock)
+    if (blockDepth != 0)
     {
-        throw ConfigFileException("Unclosed config block. Expecting }");
+        throw ConfigFileException("Unmatched curly braces");
     }
 
     std::unordered_map<std::string, std::string> pluginOpts;
 
-    ConfigParseLevel curParseLevel = ConfigParseLevel::Root;
+    std::stack<ConfigParseLevel> curParseLevel;
     std::shared_ptr<Listener> curListener;
     std::optional<BridgeConfig> curBridge;
     std::list<BridgeConfig> preMultipliedBridges;
     Settings tmpSettings;
 
+    curParseLevel.push(ConfigParseLevel::Root);
     const std::set<std::string> blockNames {"listen", "bridge"};
 
     // Then once we know the config file is valid, process it.
@@ -437,12 +437,18 @@ void ConfigFileParser::loadFile(bool test)
             const std::string &key = matches[1].str();
             if (testKeyValidity(key, "listen", blockNames))
             {
-                curParseLevel = ConfigParseLevel::Listen;
+                if (curParseLevel.top() != ConfigParseLevel::Root)
+                    throw ConfigFileException("Block '" + key + "' must be a root level");
+
+                curParseLevel.push(ConfigParseLevel::Listen);
                 curListener = std::make_shared<Listener>();
             }
             else if (testKeyValidity(key, "bridge", blockNames))
             {
-                curParseLevel = ConfigParseLevel::Bridge;
+                if (curParseLevel.top() != ConfigParseLevel::Root)
+                    throw ConfigFileException("Block '" + key + "' must be a root level");
+
+                curParseLevel.push(ConfigParseLevel::Bridge);
                 curBridge = std::make_optional<BridgeConfig>();
             }
             else
@@ -464,7 +470,7 @@ void ConfigFileParser::loadFile(bool test)
         }
         else if (std::regex_match(line, matches, block_regex_end))
         {
-            if (curParseLevel == ConfigParseLevel::Listen)
+            if (curParseLevel.top() == ConfigParseLevel::Listen)
             {
                 curListener->isValid();
 
@@ -483,13 +489,19 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 curListener.reset();
             }
-            else if (curParseLevel == ConfigParseLevel::Bridge)
+            else if (curParseLevel.top() == ConfigParseLevel::Bridge)
             {
                 curBridge->isValid();
                 preMultipliedBridges.push_back(std::move(curBridge.value()));
             }
 
-            curParseLevel = ConfigParseLevel::Root;
+            curParseLevel.pop();
+
+            if (curParseLevel.empty())
+            {
+                throw ConfigFileException("Too many closing '}'");
+            }
+
             continue;
         }
 
@@ -505,7 +517,7 @@ void ConfigFileParser::loadFile(bool test)
 
         try
         {
-            if (curParseLevel == ConfigParseLevel::Listen)
+            if (curParseLevel.top() == ConfigParseLevel::Listen)
             {
                 if (testKeyValidity(key, "protocol", validListenKeys))
                 {
@@ -576,8 +588,17 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "haproxy", validListenKeys))
                 {
-                    bool val = stringTruthiness(value);
-                    curListener->haproxy = val;
+                    if (valueTrimmed == "client_verification")
+                        curListener->haProxyMode = HaProxyMode::HaProxyClientVerification;
+                    else if (valueTrimmed == "client_verification_with_authn")
+                        curListener->haProxyMode = HaProxyMode::HaProxyClientVerficiationWithAuthn;
+                    else
+                    {
+                        const bool val = stringTruthiness(value);
+
+                        if (val)
+                            curListener->haProxyMode = HaProxyMode::On;
+                    }
                 }
                 if (testKeyValidity(key, "client_verification_ca_file", validListenKeys))
                 {
@@ -681,7 +702,7 @@ void ConfigFileParser::loadFile(bool test)
                 testCorrectNumberOfValues(key, number_of_expected_values, values);
                 continue;
             }
-            else if (curParseLevel == ConfigParseLevel::Bridge)
+            else if (curParseLevel.top() == ConfigParseLevel::Bridge)
             {
                 if (testKeyValidity(key, "local_username", validBridgeKeys))
                 {
@@ -701,12 +722,7 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "remote_session_expiry_interval", validBridgeKeys))
                 {
-                    int64_t newVal = full_stoi(key, value);
-                    if (newVal <= 0 || newVal > std::numeric_limits<uint32_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint32_t.", newVal));
-                    }
-                    curBridge->remoteSessionExpiryInterval = newVal;
+                    curBridge->remoteSessionExpiryInterval = value_to_int_ranged<uint32_t>(key, value);
                 }
                 if (testKeyValidity(key, "local_clean_start", validBridgeKeys))
                 {
@@ -714,12 +730,7 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "local_session_expiry_interval", validBridgeKeys))
                 {
-                    int64_t newVal = full_stoi(key, value);
-                    if (newVal <= 0 || newVal > std::numeric_limits<uint32_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint32_t.", newVal));
-                    }
-                    curBridge->localSessionExpiryInterval = newVal;
+                    curBridge->localSessionExpiryInterval = value_to_int_ranged<uint32_t>(key, value);
                 }
                 if (testKeyValidity(key, "subscribe", validBridgeKeys))
                 {
@@ -735,10 +746,7 @@ void ConfigFileParser::loadFile(bool test)
 
                         if (!qosstr.empty())
                         {
-                            topicPath.qos = full_stoul(key, qosstr);
-
-                            if (!topicPath.isValidQos())
-                                throw ConfigFileException(formatString("Qos '%s' is not a valid qos level", qosstr.c_str()));
+                            topicPath.qos = value_to_int_ranged<uint8_t>(key, qosstr, 0, 2);
                         }
                     }
 
@@ -759,10 +767,7 @@ void ConfigFileParser::loadFile(bool test)
 
                         if (!qosstr.empty())
                         {
-                            topicPath.qos = full_stoul(key, qosstr);
-
-                            if (!topicPath.isValidQos())
-                                throw ConfigFileException(formatString("Qos '%s' is not a valid qos level", qosstr.c_str()));
+                            topicPath.qos = value_to_int_ranged<uint8_t>(key, qosstr, 0, 2);
                         }
                     }
 
@@ -785,12 +790,7 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "port", validBridgeKeys))
                 {
-                    const int64_t newVal = full_stoi(key, value);
-                    if (newVal <= 0 || newVal > std::numeric_limits<uint16_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint16_t.", newVal));
-                    }
-                    curBridge->port = newVal;
+                    curBridge->port = value_to_int_ranged<uint16_t>(key, value);
                 }
                 if (testKeyValidity(key, "protocol_version", validBridgeKeys))
                 {
@@ -813,12 +813,7 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "keepalive", validBridgeKeys))
                 {
-                    int64_t newVal = full_stoi(key, value);
-                    if (newVal < 10 || newVal > std::numeric_limits<uint16_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint16_t and must be at least 10.", newVal));
-                    }
-                    curBridge->keepalive = newVal;
+                    curBridge->keepalive = value_to_int_ranged<uint16_t>(key, value, 10);
                 }
                 if (testKeyValidity(key, "tls", validBridgeKeys))
                 {
@@ -857,21 +852,11 @@ void ConfigFileParser::loadFile(bool test)
                 }
                 if (testKeyValidity(key, "max_incoming_topic_aliases", validBridgeKeys))
                 {
-                    const int64_t newVal = full_stoi(key, value);
-                    if (newVal < 0 || newVal > std::numeric_limits<uint16_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint16_t.", newVal));
-                    }
-                    curBridge->maxIncomingTopicAliases = newVal;
+                    curBridge->maxIncomingTopicAliases = value_to_int_ranged<uint16_t>(key, value);
                 }
                 if (testKeyValidity(key, "max_outgoing_topic_aliases", validBridgeKeys))
                 {
-                    const int64_t newVal = full_stoi(key, value);
-                    if (newVal < 0 || newVal > std::numeric_limits<uint16_t>::max())
-                    {
-                        throw ConfigFileException(formatString("Value '%d' doesn't fit in uint16_t.", newVal));
-                    }
-                    curBridge->maxOutgoingTopicAliases = newVal;
+                    curBridge->maxOutgoingTopicAliases = value_to_int_ranged<uint16_t>(key, value);
                 }
                 if (testKeyValidity(key, "inet_protocol", validBridgeKeys))
                 {
@@ -950,7 +935,6 @@ void ConfigFileParser::loadFile(bool test)
                 continue;
             }
 
-
             const std::string plugin_opt_ = "plugin_opt_";
             if (startsWith(key, plugin_opt_))
             {
@@ -1025,14 +1009,7 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "max_qos", validKeys))
                 {
-                    const int qos = full_stoi(key, value);
-                    if (qos < 0 || qos > 2)
-                    {
-                        std::ostringstream oss;
-                        oss << "Value " << qos << " for " << key << " is invalid.";
-                        throw ConfigFileException(oss.str());
-                    }
-                    tmpSettings.maxQos = qos;
+                    tmpSettings.maxQos = value_to_int_ranged<uint8_t>(key, value, 0, 2);
                 }
 
                 if (testKeyValidity(key, "mqtt3_qos_exceed_action", validKeys))
@@ -1086,6 +1063,11 @@ void ConfigFileParser::loadFile(bool test)
                     tmpSettings.logSubscriptions = tmp;
                 }
 
+                if (testKeyValidity(key, "log_publishes", validKeys))
+                {
+                    tmpSettings.logPublishes = stringTruthiness(value);
+                }
+
                 if (testKeyValidity(key, "mosquitto_password_file", validKeys))
                 {
                     checkFileExistsAndReadable("mosquitto_password_file", value, 1024*1024*1024);
@@ -1116,7 +1098,7 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "expire_sessions_after_seconds", validKeys))
                 {
-                    uint32_t newVal = full_stoul(key, value);
+                    const uint32_t newVal{value_to_int_ranged<uint32_t>(key, value)};
                     if (newVal > 0 && newVal < 60) // 0 means disable
                     {
                         throw ConfigFileException(formatString("expire_sessions_after_seconds value '%d' is invalid. Valid values are 0, or 60 or higher.", newVal));
@@ -1154,42 +1136,22 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "max_qos_msg_pending_per_client", validKeys))
                 {
-                    int newVal = full_stoi(key, value);
-                    if (newVal < 32 || newVal > 65535)
-                    {
-                        throw ConfigFileException(formatString("max_qos_msg_pending_per_client value '%d' is invalid. Valid values between 32 and 65535.", newVal));
-                    }
-                    tmpSettings.maxQosMsgPendingPerClient = newVal;
+                    tmpSettings.maxQosMsgPendingPerClient = value_to_int_ranged<uint16_t>(key, value, 32);
                 }
 
                 if (testKeyValidity(key, "max_qos_bytes_pending_per_client", validKeys))
                 {
-                    int newVal = full_stoi(key, value);
-                    if (newVal < 4096)
-                    {
-                        throw ConfigFileException(formatString("max_qos_bytes_pending_per_client value '%d' is invalid. Valid values are 4096 or higher.", newVal));
-                    }
-                    tmpSettings.maxQosBytesPendingPerClient = newVal;
+                    tmpSettings.maxQosBytesPendingPerClient = value_to_int_ranged<uint>(key, value, 4096);
                 }
 
                 if (testKeyValidity(key, "max_incoming_topic_alias_value", validKeys))
                 {
-                    int newVal = full_stoi(key, value);
-                    if (newVal < 0 || newVal > 0xFFFF)
-                    {
-                        throw ConfigFileException(formatString("max_incoming_topic_alias_value value '%d' is invalid. Valid values are between 0 and 65535.", newVal));
-                    }
-                    tmpSettings.maxIncomingTopicAliasValue = newVal;
+                    tmpSettings.maxIncomingTopicAliasValue = value_to_int_ranged<uint16_t>(key, value);
                 }
 
                 if (testKeyValidity(key, "max_outgoing_topic_alias_value", validKeys))
                 {
-                    int newVal = full_stoi(key, value);
-                    if (newVal < 0 || newVal > 0xFFFF)
-                    {
-                        throw ConfigFileException(formatString("max_outgoing_topic_alias_value value '%d' is invalid. Valid values are between 0 and 65535.", newVal));
-                    }
-                    tmpSettings.maxOutgoingTopicAliasValue = newVal;
+                    tmpSettings.maxOutgoingTopicAliasValue = value_to_int_ranged<uint16_t>(key, value);
                 }
 
                 if (testKeyValidity(key, "wills_enabled", validKeys))
@@ -1265,13 +1227,7 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "client_max_write_buffer_size", validKeys))
                 {
-                    const uint32_t minVal = 4096;
-                    uint32_t newVal = full_stoul(key, value);
-
-                    if (newVal < minVal)
-                        throw ConfigFileException(formatString("Value '%s' for '%s' is too low. It must be at least %d.", value.c_str(), key.c_str(), minVal));
-
-                    tmpSettings.clientMaxWriteBufferSize = newVal;
+                    tmpSettings.clientMaxWriteBufferSize = value_to_int_ranged<uint32_t>(key, value, 4096);
                 }
 
                 if (testKeyValidity(key, "retained_messages_delivery_limit", validKeys))
@@ -1281,7 +1237,7 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "retained_messages_node_limit", validKeys))
                 {
-                    const uint32_t newVal = full_stoul(key, value);
+                    const uint32_t newVal{value_to_int_ranged<uint32_t>(key, value)};
 
                     if (newVal == 0)
                         throw ConfigFileException("Set '" + key + "' higher than 0, or use 'retained_messages_mode'.");
@@ -1291,12 +1247,12 @@ void ConfigFileParser::loadFile(bool test)
 
                 if (testKeyValidity(key, "minimum_wildcard_subscription_depth", validKeys))
                 {
-                    const unsigned long newVal = full_stoul(key, value);
+                    tmpSettings.minimumWildcardSubscriptionDepth = value_to_int_ranged<uint16_t>(key, value);
+                }
 
-                    if (newVal > 0xFFFF)
-                        throw ConfigFileException("Option '" + key + "' must be between 0 and 65535.");
-
-                    tmpSettings.minimumWildcardSubscriptionDepth = newVal;
+                if (testKeyValidity(key, "max_topic_split_depth", validKeys))
+                {
+                    tmpSettings.maxTopicSplitDepth = value_to_int_ranged<uint16_t>(key, value);
                 }
 
                 if (testKeyValidity(key, "wildcard_subscription_deny_mode", validKeys))
@@ -1384,6 +1340,63 @@ void ConfigFileParser::loadFile(bool test)
                 {
                     bool tmp = stringTruthiness(value);
                     tmpSettings.subscriptionIdentifierEnabled = tmp;
+                }
+
+                if (testKeyValidity(key, "persistence_data_to_save", validKeys))
+                {
+                    tmpSettings.persistenceDataToSave.clearAll();
+
+                    int new_correct_number_of_args = 0;
+
+                    for(std::string arg : values)
+                    {
+                        new_correct_number_of_args++;
+                        bool set = true;
+
+                        if (arg.length() > 0 && arg.at(0) == '!')
+                        {
+                            set = false;
+                            arg.erase(0, 1);
+                        }
+
+                        if (arg == "all")
+                        {
+                            if (set)
+                                tmpSettings.persistenceDataToSave.setAll();
+                            else
+                                tmpSettings.persistenceDataToSave.clearAll();
+                        }
+                        else if (arg == "sessions_and_subscriptions")
+                        {
+                            if (set)
+                                tmpSettings.persistenceDataToSave.setFlag(PersistenceDataToSave::SessionsAndSubscriptions);
+                            else
+                                tmpSettings.persistenceDataToSave.clearFlag(PersistenceDataToSave::SessionsAndSubscriptions);
+                        }
+                        else if (arg == "retained_messages")
+                        {
+                            if (set)
+                                tmpSettings.persistenceDataToSave.setFlag(PersistenceDataToSave::RetainedMessages);
+                            else
+                                tmpSettings.persistenceDataToSave.clearFlag(PersistenceDataToSave::RetainedMessages);
+                        }
+                        else if (arg == "bridge_info")
+                        {
+                            if (set)
+                                tmpSettings.persistenceDataToSave.setFlag(PersistenceDataToSave::BridgeInfo);
+                            else
+                                tmpSettings.persistenceDataToSave.clearFlag(PersistenceDataToSave::BridgeInfo);
+                        }
+                        else
+                            throw ConfigFileException("Value '" + arg + "' is not a valid mode for " + key);
+                    }
+
+                    number_of_expected_values = new_correct_number_of_args;
+                }
+
+                if (testKeyValidity(key, "max_string_length", validKeys))
+                {
+                    tmpSettings.maxStringLength = value_to_int_ranged<uint16_t>(key, valueTrimmed);
                 }
             }
         }

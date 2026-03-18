@@ -40,7 +40,7 @@ class MainApp
     friend class MainAppAsFork;
 #endif
 
-    static MainApp *instance;
+    std::weak_ptr<MainApp> mSelf;
     int num_threads = 0;
 
     bool started = false;
@@ -53,8 +53,11 @@ class MainApp
     bool doConfigReload = false;
     bool doLogFileReOpen = false;
     bool doQuitAction = false;
+    bool errorExit = false;
     bool doMemoryTrim = false;
+    size_t threadsPendingInit = 0;
     QueuedTasks timed_tasks;
+    MutexOwned<std::vector<std::function<void()>>> taskQueue;
 
     uint overloadLogCounter = 0;
     DriftCounter drift;
@@ -69,44 +72,44 @@ class MainApp
     std::mutex quitMutex;
     std::string fuzzFilePath;
     OneInstanceLock oneInstanceLock;
+    const pthread_t mInitializedByThread = pthread_self();
 
     Logger *logger = Logger::getInstance();
 
     BackgroundWorker bgWorker;
 
+    void setSelf(const std::shared_ptr<MainApp> &self);
     bool getFuzzMode() const;
     void setlimits();
     void loadConfig(bool reload);
     void reloadConfig();
     void reopenLogfile();
-    void reloadTimers(bool reload, const Settings &old_settings);
+    void reloadTimers(const Settings *old_settings);
     static void doHelp(const char *arg);
     static void showLicense();
-    std::list<ScopedSocket> createListenSocket(const std::shared_ptr<Listener> &listener);
+    std::list<ScopedSocket> createListenSocket(const std::shared_ptr<Listener> &listener, bool do_listen);
     void wakeUpThread();
+    void addImmediateTask(std::function<void ()> f);
     void queueKeepAliveCheckAtAllThreads();
     void queuePasswordFileReloadAllThreads();
     void queuepluginPeriodicEventAllThreads();
     void setFuzzFile(const std::string &fuzzFilePath);
     void queuePublishStatsOnDollarTopic();
-    static void saveState(const Settings &settings, const std::list<BridgeInfoForSerializing> &bridgeInfos, bool in_background);
-    static void saveBridgeInfo(const std::string &filePath, const std::list<BridgeInfoForSerializing> &bridgeInfos);
-    static std::list<BridgeConfig> loadBridgeInfo(Settings &settings);
     void saveStateInThread();
     void queueSendQueuedWills();
     void waitForWillsQueued();
     void queueRetainedMessageExpiration();
     void sendBridgesToThreads();
-    void queueBridgeReconnectAllThreads(bool alsoQueueNexts);
+    void queueBridgeReconnectAllThreads();
     void queueInternalHeartbeat();
+    void performAllImmediateTasks();
 
     MainApp(const std::string &configFilePath);
 public:
     MainApp(const MainApp &rhs) = delete;
     MainApp(MainApp &&rhs) = delete;
     ~MainApp();
-    static MainApp *getMainApp();
-    static void initMainApp(int argc, char *argv[]);
+    static std::shared_ptr<MainApp> initMainApp(int argc, char *argv[]);
     void start();
     void queueQuit();
     void quit();
@@ -119,6 +122,7 @@ public:
     void queuePurgeSubscriptionTree();
     void queueMemoryTrim();
     void memoryTrim();
+    void queueThreadInitDecrement();
 };
 
 #endif // MAINAPP_H

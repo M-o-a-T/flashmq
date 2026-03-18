@@ -10,12 +10,12 @@ See LICENSE for license details.
 
 #include "logger.h"
 #include <sstream>
-#include <iomanip>
 #include <string.h>
 #include <functional>
 #include <mutex>
 
 #include "threaddata.h"
+#include "globals.h"
 #include "threadglobals.h"
 #include "utils.h"
 
@@ -39,11 +39,6 @@ LogLine::LogLine() :
 
 }
 
-const char *LogLine::c_str() const
-{
-    return line.c_str();
-}
-
 bool LogLine::alsoLogToStdOut() const
 {
     return alsoToStdOut;
@@ -62,10 +57,9 @@ Logger::~Logger()
     if (running)
         quit();
 
-    if (file)
+    if (ofile.is_open())
     {
-        fclose(file);
-        file = nullptr;
+        ofile.close();
     }
 
     sem_close(&linesPending);
@@ -91,6 +85,8 @@ std::string_view Logger::getLogLevelString(int level)
         return "SUBSCRIBE";
     case LOG_UNSUBSCRIBE:
         return "UNSUBSCRIBE";
+    case LOG_PUBLISH:
+        return "PUBLISH";
     default:
         return "UNKNOWN LOG LEVEL";
     }
@@ -129,6 +125,11 @@ StreamToLog Logger::log(int level)
     return StreamToLog(level);
 }
 
+bool Logger::wouldLog(int level) const
+{
+    return static_cast<bool>(level & curLogLevel);
+}
+
 void Logger::queueReOpen()
 {
     reload = true;
@@ -139,24 +140,19 @@ void Logger::reOpen()
 {
     reload = false;
 
-    if (file)
+    if (ofile.is_open())
     {
-        // Any further use of 'file' is undefined behavior, including closing again, so we just have to abandon it.
-        const int rc = fclose(file);
-        file = nullptr;
-
-        if (rc != 0)
-        {
-            const std::string err(strerror(errno));
-            log(LOG_ERR) << "Closing the log file failed with: " << err << ". Depending on whether it can be reopened again, logging may continue on stdout.";
-        }
+        ofile.close();
     }
 
     if (logPath.empty())
         return;
 
-    if ((file = fopen(logPath.c_str(), "a")) == nullptr)
+    ofile.open(logPath, std::ios::app | std::ios::out);
+
+    if (!ofile.good())
     {
+        ofile.close();
         logf(LOG_ERR, "(Re)opening log file '%s' error: %s. Logging to stdout.", logPath.c_str(), strerror(errno));
     }
 }
@@ -185,7 +181,7 @@ void Logger::setLogPath(const std::string &path)
  *
  * The subscriptions flag is still set explicitly, because you may want that irrespective of the log level.
  */
-void Logger::setFlags(LogLevel level, bool logSubscriptions)
+void Logger::setFlags(LogLevel level, bool logSubscriptions, bool logPublishes)
 {
     curLogLevel = 0;
 
@@ -204,6 +200,11 @@ void Logger::setFlags(LogLevel level, bool logSubscriptions)
         curLogLevel |= (LOG_UNSUBSCRIBE | LOG_SUBSCRIBE);
     else
         curLogLevel &= ~(LOG_UNSUBSCRIBE | LOG_SUBSCRIBE);
+
+    if (logPublishes)
+        curLogLevel |= LOG_PUBLISH;
+    else
+        curLogLevel &= ~LOG_PUBLISH;
 }
 
 /**
@@ -281,45 +282,58 @@ void Logger::writeLog()
             lines.pop();
         }
 
-        if (this->file)
+        if (ofile.is_open())
         {
-            if (fputs(line.c_str(), this->file) < 0 ||
-                fputs("\n", this->file) < 0 ||
-                fflush(this->file) != 0)
+            ofile << line.getLine() << std::endl;
+
+            if (!ofile.good())
             {
-                alsoLogToStd = true;
-                fputs("Writing to log failed. Enabling stdout logger.", stderr);
+                std::cerr << "Writing to log failed. Closing file and enabling stdout logger" << std::endl;
+                ofile.close();
             }
         }
 
-        if (!this->file || line.alsoLogToStdOut())
+        if (!(ofile.is_open() && ofile.good()) || line.alsoLogToStdOut())
         {
-            FILE *output = stdout;
 #ifdef TESTING
-            output = stderr; // the stdout interfers with Qt test XML output, so using stderr.
+            std::cerr << line.getLine() << std::endl; // the stdout interfers with Qt test XML output, so using stderr.
+#else
+            std::cout << line.getLine() << std::endl;
 #endif
-            fputs(line.c_str(), output);
-            fputs("\n", output);
-            fflush(output);
         }
     }
 }
 
 std::string Logger::getPrefix(int level)
 {
-    int threadnr = -1;
-    const std::shared_ptr<ThreadData> td = ThreadGlobals::getThreadData();
-    if (td)
-        threadnr = td->threadnr;
+    thread_local static auto caller_thread_id = pthread_self();
+    const auto td = ThreadGlobals::getThreadData();
 
     std::ostringstream oss;
     const std::string stamp = timestampWithMillis();
     oss << "[" << stamp << "] [" << getLogLevelString(level) << "] ";
 
-    if (threadnr == -1)
+    if (td)
+    {
+        oss << "[T " << td->threadnr << "] ";
+    }
+    else if (pthread_equal(caller_thread_id, globals->createdByThread))
+    {
         oss << "[main] ";
+    }
     else
-        oss << "[T " << threadnr << "] ";
+    {
+        std::array<char, 20> buf{};
+        if (pthread_getname_np(caller_thread_id, buf.data(), buf.size()) == 0)
+        {
+            std::string tname(buf.data());
+            oss << "[T " << tname << "] ";
+        }
+        else
+        {
+            oss << "[T custom] ";
+        }
+    }
 
     std::string result = oss.str();
     return result;

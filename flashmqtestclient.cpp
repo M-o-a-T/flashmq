@@ -32,7 +32,7 @@ void FlashMQTestClient::ReceivedObjects::clear()
 }
 
 FlashMQTestClient::FlashMQTestClient() :
-    testServerWorkerThreadData(0, settings, pluginLoader)
+    testServerWorkerThreadData(0, settings, pluginLoader, {})
 {
 }
 
@@ -105,8 +105,7 @@ void FlashMQTestClient::connectClient(ProtocolVersion protocolVersion, bool clea
 {
     int sockfd = check<std::runtime_error>(socket(AF_INET, SOCK_STREAM, 0));
 
-    struct sockaddr_in servaddr;
-    bzero(&servaddr, sizeof(servaddr));
+    struct sockaddr_in servaddr{};
 
     const std::string hostname = "127.0.0.1";
 
@@ -127,13 +126,14 @@ void FlashMQTestClient::connectClient(ProtocolVersion protocolVersion, bool clea
     const std::string clientid = formatString("testclient_%d", clientCount++);
 
     std::shared_ptr<Client> client = std::make_shared<Client>(
-        ClientType::Normal, sockfd, testServerWorkerThreadData.getThreadData(), FmqSsl(), ConnectionProtocol::Mqtt, false, reinterpret_cast<struct sockaddr*>(&servaddr), settings);
+        ClientType::Normal, sockfd, testServerWorkerThreadData.getThreadData(), FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, reinterpret_cast<struct sockaddr*>(&servaddr), settings);
     this->client_weak = client;
     client->setClientProperties(protocolVersion, clientid, {}, "user", false, 60);
 
     {
         // Hack to make it work with the rvalue argument whilest not voiding our own client.
         std::shared_ptr<Client> dummyToMoveFrom = client;
+        client->addToEpoll(EPOLLIN); // Normally the worker thread does this, but we must avoid races, for the code below, that already tries to mod the epoll.
         testServerWorkerThreadData->giveClient(std::move(dummyToMoveFrom));
     }
 
@@ -205,12 +205,12 @@ void FlashMQTestClient::subscribe(const std::string topic, uint8_t qos, bool noL
 
     const uint16_t packet_id = 66;
 
-    Subscribe sub(client->getProtocolVersion(), packet_id, topic, qos);
-    sub.noLocal = noLocal;
-    sub.retainAsPublished = retainAsPublished;
-    sub.subscriptionIdentifier = subscriptionIdentifier;
-    sub.retainHandling = retainHandling;
-    MqttPacket subPack(sub);
+    std::vector<Subscribe> subs;
+    subs.emplace_back(topic, qos);
+    subs.back().noLocal = noLocal;
+    subs.back().retainAsPublished = retainAsPublished;
+    subs.back().retainHandling = retainHandling;
+    MqttPacket subPack(client->getProtocolVersion(), packet_id, subscriptionIdentifier, subs);
     client->writeMqttPacketAndBlameThisClient(subPack);
 
     waitForCondition([&]() {
@@ -240,8 +240,9 @@ void FlashMQTestClient::unsubscribe(const std::string &topic)
 
     const uint16_t packet_id = 66;
 
-    Unsubscribe unsub(client->getProtocolVersion(), packet_id, topic);
-    MqttPacket unsubPack(unsub);
+    std::vector<Unsubscribe> unsubs;
+    unsubs.emplace_back(topic);
+    MqttPacket unsubPack(client->getProtocolVersion(), packet_id, unsubs);
     client->writeMqttPacketAndBlameThisClient(unsubPack);
 
     waitForCondition([&]() {

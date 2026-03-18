@@ -179,6 +179,17 @@ multi-value-param one 'two' "three" "with ' char"
           </para>
         </listitem>
       </varlistentry>
+      <varlistentry xml:id="log_publishes" condition="flashmq ≥ 1.25.0">
+        <term><option>log_publishes</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
+        <listitem>
+          <para>
+            Both publishes and QoS actions related to publishes are logged at this level.
+          </para>
+          <para>
+            Default value: <literal>false</literal>
+          </para>
+        </listitem>
+      </varlistentry>
       <varlistentry xml:id="allow_unsafe_clientid_chars">
         <term><option>allow_unsafe_clientid_chars</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
         <listitem>
@@ -198,6 +209,23 @@ multi-value-param one 'two' "three" "with ' char"
           </para>
           <para>
             Default value: <literal>false</literal>
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="max_string_length" condition="flashmq ≥ 1.26.0">
+        <term><option>max_string_length</option> <replaceable>bytes</replaceable></term>
+        <listitem>
+          <para>
+            The max length of almost all strings encoded in MQTT packets. This includes topics, user properties, client IDs, etc. Some fields, like passwords, are excluded. Payloads are also excluded (as they are not strings).
+          </para>
+          <para>
+            The reason is to avoid abuse. The default should be enough for most deployments.
+          </para>
+          <para>
+            If the limit is tripped, the error in the log will clearly say so, and mention <option>max_string_length</option>.
+          </para>
+          <para>
+            Default value: <literal>4096</literal>
           </para>
         </listitem>
       </varlistentry>
@@ -360,6 +388,20 @@ multi-value-param one 'two' "three" "with ' char"
           </para>
           <para>
             Default: 3623
+          </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry xml:id="persistence_data_to_save" condition="flashmq ≥ 1.24.0">
+        <term><option>persistence_data_to_save</option> <replaceable>all|sessions_and_subscriptions|retained_messages|bridge_info</replaceable></term>
+        <listitem>
+          <para>
+              When a <option>storage_dir</option> is defined, specify which information should be saved. The arguments are a list of one or more of the specified options, and can be negated with a !. Meaning like: <literal>all !retained_messages</literal>. The order is relevant. If you end with <literal>all</literal>, it overrides the previous.
+          </para>
+          <para>
+              The option <literal>bridge_info</literal> causes a small bit of meta data of the bridges to be saved. See the bridge option <link xlink:href="#bridge__use_saved_clientid"><option>use_saved_clientid</option></link>.
+          </para>
+          <para>
+            The default is <literal>all</literal>, but as soon as this option is defined, it's cleared, and the desired list has to be composed.
           </para>
         </listitem>
       </varlistentry>
@@ -653,6 +695,24 @@ multi-value-param one 'two' "three" "with ' char"
           </para>
           <para>
             Default: <replaceable>0</replaceable>
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry xml:id="max_topic_split_depth" condition="flashmq ≥ 1.26.0">
+        <term><option>max_topic_split_depth</option> <replaceable>number</replaceable></term>
+        <listitem>
+          <para>
+            Defines the maximum number of components a topic/filter string can have. For example, <literal>one/two/three</literal> has three.
+          </para>
+          <para>
+            The reason is to avoid abuse. The default should be enough for most deployments.
+          </para>
+          <para>
+            If the limit is tripped, the error in the log will clearly say so, and mention <option>max_topic_split_depth</option>.
+          </para>
+          <para>
+            Default: <replaceable>128</replaceable>
           </para>
         </listitem>
       </varlistentry>
@@ -984,18 +1044,43 @@ multi-value-param one 'two' "three" "with ' char"
         </listitem>
       </varlistentry>
 
-      <varlistentry xml:id="haproxy" condition="flashmq ≥ 1.1.0">
-        <term><option>haproxy</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
+      <varlistentry xml:id="haproxy" condition="flashmq ≥ 1.25.0">
+        <term><option>haproxy</option> <replaceable>off</replaceable>|<replaceable>on</replaceable>|<replaceable>client_verification</replaceable>|<replaceable>client_verification_with_authn</replaceable></term>
         <listitem>
           <para>
-            Setting the listener to haproxy makes it expect the PROXY protocol and set client source address to the original client. Make sure this listener is private / firewalled, otherwise anybody can set a different source address.
+              The nature of running something behind a proxy is that you would lose certain information or abilities. For that, HAProxy allows sending information in a header frame. With the <option>haproxy</option> option, you can configure the following:
           </para>
+          <para>
+            <literal>off</literal> and <literal>on</literal> configure basic functionality: reading the client's source address from the haproxy frame. This address will be shown in the logs and plugin functions.
+          </para>
+          <para>
+            <literal>client_verification</literal> and <literal>client_verification_with_authn</literal> will require haproxy to send the <literal>PP2_SUBTYPE_SSL_CN</literal> field when using mTLS (mutual TLS), i.e. client authentication. When using the <literal>client_verification_with_authn</literal> option, FlashMQ's internal authentication will still happen (with the username from the certificate). This can be convenient when you have a plugin, so that you can still take action in the login hook.
+          </para>
+
+          <para>
+            Make sure this listener is private, firewalled or use <option>only_allow_from</option>, otherwise anybody can set a different source address.
+          </para>
+
           <para>
             Note that HAProxy's server health checks only started using the 'local' specifier as of version 2.4. This means earlier version will pretend to be a client and break the connection, causing log spam.
           </para>
+
           <para>
             As a side note about using a proxy on your listener; you can only have an absolute max of 65535 connections to an IP+port combination (and the practical limit is lower). If you need more, you have to set up multiple listeners. This can be multiple IP addresses, or simply multiple ports.
           </para>
+
+          <para>
+            The following is an example HAProxy backend config for the features described:
+          </para>
+
+          <literallayout language="flashmq.conf" class="monospaced"><![CDATA[
+backend backend_server
+        mode tcp
+        timeout client  2m
+        timeout connect 10s
+        timeout server  2m
+        server server1 ::1:1885 send-proxy-v2 send-proxy-v2-ssl-cn ]]></literallayout>
+
           <para>
             See <link xlink:href="http://www.haproxy.org/">haproxy.org</link>.
           </para>
@@ -1377,7 +1462,7 @@ listen {
         <term><option>use_saved_clientid</option> <replaceable>true</replaceable>|<replaceable>false</replaceable></term>
         <listitem>
           <para>
-              When you want your bridges to resume local and remote sessions after restart, set this to true and set <option>remote_clean_start</option>, <option>local_clean_start</option>, <option>remote_session_expiry_interval</option> and <option>local_session_expiry_interval</option> accordingly. It only has effect when you have set a <option>storage_dir</option>.
+              When you want your bridges to resume local and remote sessions after restart, set this to true and set <option>remote_clean_start</option>, <option>local_clean_start</option>, <option>remote_session_expiry_interval</option> and <option>local_session_expiry_interval</option> accordingly. It only has effect when you have set a <option>storage_dir</option> and include <literal>bridge_info</literal> in <option>persistence_data_to_save</option>.
           </para>
           <para>
               It is important to fully understand the clean session / clean start behavior and the role the client ID plays in that. The primary goal of sessions is to survive link disconnects. Configuring a fixed client ID and use that each time an MQTT client starts, is often an anti-pattern, because most clients like actual IoT devices start fresh upon restart and don't store their sessions (with in-flight packets, etc) to disk. FlashMQ does store it on disk however, so it can be used legitamately. However, you can run into unexpected situations. For instance, you will get your existing subscriptions from the session too. So, if you remove a <option>subscribe</option> line from your bridge configuration and restart, it will actually have no effect, because the server on the other side still has that subscription in the session.

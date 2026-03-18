@@ -21,6 +21,7 @@ See LICENSE for license details.
 #include "listener.h"
 #include "network.h"
 #include "bridgeconfig.h"
+#include "flags.h"
 
 #define ABSOLUTE_MAX_PACKET_SIZE 268435455
 #define HEARTBEAT_INTERVAL 1000
@@ -49,6 +50,13 @@ enum class WildcardSubscriptionDenyMode
     DenyRetainedOnly
 };
 
+enum class PersistenceDataToSave
+{
+    SessionsAndSubscriptions = 1,
+    RetainedMessages = 2,
+    BridgeInfo = 3
+};
+
 void checkUniqueBridgeNames(const std::list<BridgeConfig> &bridges);
 
 class Settings
@@ -70,6 +78,7 @@ public:
     bool pluginSerializeInit = false;
     bool pluginSerializeAuthChecks = false;
     bool logSubscriptions = false;
+    bool logPublishes = false;
     bool subscriptionIdentifierEnabled = true;
     int clientInitialBufferSize = 1024; // Must be power of 2
     uint32_t maxPacketSize = ABSOLUTE_MAX_PACKET_SIZE;
@@ -77,6 +86,7 @@ public:
     uint16_t maxIncomingTopicAliasValue = 65535;
     uint16_t maxOutgoingTopicAliasValue = 65535;
     uint8_t maxQos = 2;
+    uint16_t maxStringLength = 4096;
     Mqtt3QoSExceedAction mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
 #ifdef TESTING
     std::optional<bool> logDebug;
@@ -104,6 +114,7 @@ public:
     RetainedMessagesMode retainedMessagesMode = RetainedMessagesMode::Enabled;
     SharedSubscriptionTargeting sharedSubscriptionTargeting = SharedSubscriptionTargeting::RoundRobin;
     uint16_t minimumWildcardSubscriptionDepth = 0;
+    uint16_t maxTopicSplitDepth = 128;
     WildcardSubscriptionDenyMode wildcardSubscriptionDenyMode = WildcardSubscriptionDenyMode::DenyAll;
     bool zeroByteUsernameIsAnonymous = false;
     std::chrono::milliseconds maxEventLoopDrift = std::chrono::milliseconds(2000);
@@ -111,6 +122,7 @@ public:
     std::chrono::milliseconds setRetainedMessageDeferTimeout = std::chrono::milliseconds(0);
     std::chrono::milliseconds setRetainedMessageDeferTimeoutSpread = std::chrono::milliseconds(1000);
     std::chrono::seconds saveStateInterval = std::chrono::seconds(3623);
+    Flags<PersistenceDataToSave> persistenceDataToSave;
     std::list<std::shared_ptr<Listener>> listeners; // Default one is created later, when none are defined.
 
     std::list<Network> setRealIpFrom;
@@ -130,6 +142,8 @@ public:
     bool matchAddrWithSetRealIpFrom(const struct sockaddr_in *addr) const;
 
     std::list<BridgeConfig> stealBridges();
+
+    Settings();
 };
 
 #endif // SETTINGS_H

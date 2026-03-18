@@ -107,7 +107,9 @@ void IoWrapper::startOrContinueSslConnect()
         if (error_code == 0)
             errorMsg = "Error code was 0. Are you really connecting to a TLS socket?";
 
-        throw std::runtime_error("Problem connecting to SSL socket: " + errorMsg);
+        // We upgrade the error to WARNING because outgoing connections are under our control and failures
+        // should not be 'normal' in the log, as opposed to incoming clients.
+        throw BadClientException("Problem connecting to SSL socket: " + errorMsg, LOG_WARNING);
 
     }
     parentClient->setReadyForWriting(false); // Undo write readiness that may have have happened during SSL handshake
@@ -136,7 +138,7 @@ void IoWrapper::startOrContinueSslAccept()
         if (error_code == OPENSSL_WRONG_VERSION_NUMBER)
             errorMsg = "Wrong protocol version number. Probably a non-SSL connection on SSL socket.";
 
-        throw std::runtime_error("Problem accepting SSL socket: " + errorMsg);
+        throw BadClientException("Problem accepting SSL socket: " + errorMsg);
     }
     parentClient->setReadyForWriting(false); // Undo write readiness that may have have happened during SSL handshake
     sslAccepted = true;
@@ -271,11 +273,6 @@ const char *IoWrapper::getSslVersion() const
     return SSL_get_version(ssl.get());
 }
 
-bool IoWrapper::needsHaProxyParsing() const
-{
-    return _needsHaProxyParsing;
-}
-
 /**
  * @brief IoWrapper::readHaProxyData Reads the PROXY protocol header in one go. It must fit in one TCP segment.
  * @param fd
@@ -283,20 +280,18 @@ bool IoWrapper::needsHaProxyParsing() const
  *
  * https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
  */
-std::tuple<HaProxyConnectionType, std::optional<FMQSockaddr>> IoWrapper::readHaProxyData(int fd)
+std::optional<FMQSockaddr> IoWrapper::readHaProxyHeader(int fd)
 {
-    _needsHaProxyParsing = false;
+    assert(mHaProxyStage == HaProxyStage::HeaderPending);
 
-    struct proxy_hdr_v2 hdr;
-    memset(&hdr, 0, sizeof(hdr));
-
+    struct proxy_hdr_v2 hdr {};
     const size_t read = read_ha_proxy_helper(fd, &hdr, sizeof(hdr));
 
     if (read != sizeof(hdr))
         throw std::runtime_error("Reading haproxy header resulted in wrong number of bytes.");
 
     if (std::memcmp(hdr.sig, "\r\n\r\n\0\r\nQUIT\n", 12) != 0)
-        throw std::runtime_error("Invalid HAProxy signature.");
+        throw BadClientException("Invalid HAProxy signature.");
 
     const uint8_t family = (hdr.fam & 0xF0) >> 4;
     const uint8_t prot = hdr.fam & 0x0F;
@@ -304,65 +299,140 @@ std::tuple<HaProxyConnectionType, std::optional<FMQSockaddr>> IoWrapper::readHaP
     const uint8_t ver = (hdr.ver_cmd & 0xF0) >> 4;
     const uint8_t cmd = hdr.ver_cmd & 0x0F;
 
-    const uint16_t len = ntohs(hdr.len);
+    const uint16_t total_len{ntohs(hdr.len)};
 
-    if (len > sizeof(union proxy_addr))
-        throw std::runtime_error("Hacker be gone.");
+    uint16_t addr_len = 0;
 
-    std::array<char, sizeof(union proxy_addr)> addr_block;
-    std::fill(addr_block.begin(), addr_block.end(), 0);
-    read_ha_proxy_helper(fd, addr_block.data(), len);
+    if (family == 0)
+        addr_len = 0;
+    else if (family == 1)
+        addr_len = sizeof(proxy_ipv4_addr);
+    else if (family == 2)
+        addr_len = sizeof(proxy_ipv6_addr);
+    else if (family == 3)
+        addr_len = sizeof(proxy_unix_addr);
+    else
+        throw BadClientException("Unsupported haproxy address family");
+
+    if (total_len < addr_len)
+        throw BadClientException("Bad HAProxy length: length specified is less than the signaled address length");
+    else if (total_len == addr_len)
+        mHaProxyStage = HaProxyStage::DoneOrNotNeeded;
+    else
+    {
+        mHaProxyStage = HaProxyStage::AdditionalBytesPending;
+        mHaProxyAdditionalBytesLeft = total_len - addr_len;
+    }
+
+    std::array<char, sizeof(union proxy_addr)> addr_block{};
+    read_ha_proxy_helper(fd, addr_block.data(), addr_len);
 
     if (ver != 2)
-        throw std::runtime_error("Only HAProxy protocol version 2 is supported");
+        throw BadClientException("Only HAProxy protocol version 2 is supported");
 
     if (cmd == 0)
-        return {HaProxyConnectionType::Local, {}};
+    {
+        mHaProxyConnectionType = HaProxyConnectionType::Local;
+        return {};
+    }
 
     if (cmd != 1)
-        throw std::runtime_error("HAProxy command must be 1");
+        throw BadClientException("HAProxy command must be 1");
 
     if (prot == 0)
-        return {HaProxyConnectionType::Local, {}};
+    {
+        mHaProxyConnectionType = HaProxyConnectionType::Local;
+        return {};
+    }
+
+    mHaProxyConnectionType = HaProxyConnectionType::Remote;
 
     if (prot > 2)
-        throw std::runtime_error("Invalid protocol in HAProxy.");
+        throw BadClientException("Invalid protocol in HAProxy.");
 
     if (family == 1)
     {
         struct proxy_ipv4_addr paddr;
         std::memcpy(&paddr, addr_block.data(), sizeof(paddr));
 
-        struct sockaddr_in addr;
-        std::memset(&addr, 0, sizeof(addr));
+        struct sockaddr_in addr {};
 
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = paddr.src_addr;
         addr.sin_port = paddr.src_port;
 
-        return {HaProxyConnectionType::Remote, FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr))};
+        return FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr));
     }
     else if (family == 2)
     {
         struct proxy_ipv6_addr paddr;
         std::memcpy(&paddr, addr_block.data(), sizeof(paddr));
 
-        struct sockaddr_in6 addr;
-        std::memset(&addr, 0, sizeof(addr));
+        struct sockaddr_in6 addr {};
 
         addr.sin6_family = AF_INET6;
         memcpy(&addr.sin6_addr, paddr.src_addr, sizeof(struct in6_addr));
         addr.sin6_port = paddr.src_port;
 
-        return {HaProxyConnectionType::Remote, FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr))};
+        return FMQSockaddr(reinterpret_cast<struct sockaddr*>(&addr));
     }
 
-    throw std::runtime_error("Unsupported haproxy address family");
+    throw BadClientException("Unsupported haproxy address family");
 }
 
-void IoWrapper::setHaProxy(bool val)
+void IoWrapper::readHaProxyAdditionalData(int fd)
 {
-    this->_needsHaProxyParsing = val;
+    assert(mHaProxyStage == HaProxyStage::AdditionalBytesPending);
+
+    while (mHaProxyAdditionalBytesLeft > 0)
+    {
+        std::array<unsigned char, 256> buf{};
+        const size_t readlen{std::min<size_t>(buf.size(), mHaProxyAdditionalBytesLeft)};
+        const ssize_t n{read(fd, buf.data(), readlen)};
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            if (errno == EWOULDBLOCK || errno == EAGAIN)
+                break;
+            check<BadClientException>(n);
+        }
+        else if (n == 0)
+        {
+            throw BadClientException("HaProxy client disconnected before additional data could be read");
+        }
+
+        FMQ_ENSURE(n <= mHaProxyAdditionalBytesLeft && static_cast<size_t>(n) <= buf.size());
+
+        const size_t oldSize{mHaProxyAdditionalData.size()};
+        mHaProxyAdditionalData.resize(oldSize + n);
+        std::copy(buf.begin(), buf.begin() + n, mHaProxyAdditionalData.begin() + oldSize);
+        mHaProxyAdditionalBytesLeft -= n;
+    }
+
+    if (mHaProxyAdditionalBytesLeft == 0)
+    {
+        mHaProxyStage = HaProxyStage::DoneOrNotNeeded;
+
+        int recurse_counter = 0;
+        const auto haproxy_tlvs = read_ha_proxy_pp2_tlv(this->mHaProxyAdditionalData, recurse_counter);
+        std::vector<unsigned char>().swap(this->mHaProxyAdditionalData);
+
+        auto pos = haproxy_tlvs.find(PP2_TYPE_SSL);
+        if (pos != haproxy_tlvs.end())
+        {
+            HaProxySslData data = std::get<HaProxySslData>(pos->second);
+
+            // At this point, we don't use anything but the CN.
+            mHaProxySslCnName = data.ssl_cn;
+        }
+    }
+}
+
+void IoWrapper::setHaProxy()
+{
+    this->mHaProxyStage = HaProxyStage::HeaderPending;
 }
 
 #ifndef NDEBUG
@@ -399,7 +469,7 @@ ssize_t IoWrapper::readOrSslRead(int fd, void *buf, size_t nbytes, IoWrapResult 
             else if (errno == EAGAIN || errno == EWOULDBLOCK)
                 *error = IoWrapResult::Wouldblock;
             else
-                check<std::runtime_error>(n);
+                check<BadClientException>(n);
         }
         else if (n == 0)
         {
@@ -470,14 +540,14 @@ ssize_t IoWrapper::readOrSslRead(int fd, void *buf, size_t nbytes, IoWrapResult 
 
             char *err = strerror(errno);
             std::string msg(err);
-            throw std::runtime_error("SSL read syscall error: " + msg);
+            throw BadClientException("SSL read syscall error: " + msg);
         }
 
         std::array<char, OPENSSL_ERROR_STRING_SIZE> error_buf;
         ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
         const std::string errorString(error_buf.data());
         ERR_print_errors_cb(logSslError, NULL);
-        throw std::runtime_error("SSL socket error reading: " + errorString);
+        throw BadClientException("SSL socket error reading: " + errorString);
     }
 }
 
@@ -500,7 +570,7 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
             else if (errno == EAGAIN || errno == EWOULDBLOCK)
                 *error = IoWrapResult::Wouldblock;
             else
-                check<std::runtime_error>(n);
+                check<BadClientException>(n);
         }
     }
     else
@@ -552,7 +622,7 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
                     {
                         char *err = strerror(errno);
                         std::string msg(err);
-                        throw std::runtime_error(msg);
+                        throw BadClientException(msg);
                     }
                 }
 
@@ -560,7 +630,7 @@ ssize_t IoWrapper::writeOrSslWrite(int fd, const void *buf, size_t nbytes, IoWra
                 ERR_error_string_n(error_code, error_buf.data(), error_buf.size());
                 const std::string errorString(error_buf.data());
                 ERR_print_errors_cb(logSslError, NULL);
-                throw std::runtime_error("SSL socket error writing: " + errorString);
+                throw BadClientException("SSL socket error writing: " + errorString);
             }
         }
     }
@@ -773,7 +843,7 @@ ssize_t IoWrapper::websocketBytesToReadBuffer(void *buf, const size_t nbytes, Io
             while (shift > 0)
             {
                 shift -= 8;
-                uint8_t byte = websocketPendingBytes.peakAhead(i++);
+                uint64_t byte {static_cast<uint8_t>(websocketPendingBytes.peakAhead(i++))};
                 extendedPayloadLength += (byte << shift);
             }
 

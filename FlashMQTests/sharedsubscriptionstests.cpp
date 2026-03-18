@@ -11,17 +11,17 @@ void MainTests::testSharedSubscribersUnit()
 {
     Settings settings;
     std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
-    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader));
+    std::shared_ptr<ThreadData> t(new ThreadData(0, settings, pluginLoader, std::weak_ptr<MainApp>()));
 
     ThreadGlobals::assignThreadData(t);
 
-    std::shared_ptr<Client> c1(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> c1(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     c1->setClientProperties(ProtocolVersion::Mqtt5, "clientid1", {}, "user1", true, 60);
 
-    std::shared_ptr<Client> c2(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> c2(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     c2->setClientProperties(ProtocolVersion::Mqtt5, "clientid2", {}, "user2", true, 60);
 
-    std::shared_ptr<Client> c3(new Client(ClientType::Normal, 0, t, FmqSsl(), ConnectionProtocol::Mqtt, false, nullptr, settings, false));
+    std::shared_ptr<Client> c3(new Client(ClientType::Normal, -1, t, FmqSsl(), ConnectionProtocol::Mqtt, HaProxyMode::Off, nullptr, settings, false));
     c3->setClientProperties(ProtocolVersion::Mqtt5, "clientid3", {}, "user3", true, 60);
 
     std::shared_ptr<Session> ses1 = std::make_shared<Session>(c1->getClientId(), c1->getUsername(), std::optional<std::string>());
@@ -285,6 +285,9 @@ void MainTests::testSharedSubscribersSurviveRestart()
 
     QCOMPARE(rain, 1);
     QCOMPARE(sun, 1);
+
+    // This makes sure the server is shutdown before FlashMQTempDir can remove our temp dir.
+    cleanup();
 }
 
 void MainTests::testSharedSubscriberDoesntGetRetainedMessages()

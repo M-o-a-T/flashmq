@@ -62,7 +62,7 @@ Client::WriteBuf::WriteBuf(size_t size) :
  */
 Client::Client(
         ClientType type, int fd, std::shared_ptr<ThreadData> threadData, FmqSsl &&ssl, ConnectionProtocol connectionProtocol,
-        bool haproxy, const struct sockaddr *addr, const Settings &settings, bool fuzzMode) :
+        HaProxyMode haProxyMode, const struct sockaddr *addr, const Settings &settings, bool fuzzMode) :
     fd(fd),
     fuzzMode(fuzzMode),
     maxOutgoingPacketSize(settings.maxPacketSize),
@@ -74,17 +74,29 @@ Client::Client(
     readbuf(settings.clientInitialBufferSize),
     writebuf(settings.clientInitialBufferSize),
     clientType(type),
-    epoll_fd(threadData ? threadData->getEpollFd() : 0),
+    mHaProxyMode(haProxyMode),
     threadData(threadData),
     addr(addr)
 {
-    ioWrapper.setHaProxy(haproxy);
+    assert(fd == -1 || fd > 2);
 
-    int flags = fcntl(fd, F_GETFL);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (haProxyMode > HaProxyMode::Off)
+        ioWrapper.setHaProxy();
 
-    const std::string haproxy_s = haproxy ? "/HAProxy" : "";
-    const std::string ssl_s = ssl ? "/SSL" : "/Non-SSL";
+    if (fd > -1)
+    {
+        int flags = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    std::string haproxy_s;
+
+    if (haProxyMode == HaProxyMode::On)
+        haproxy_s = "/HAProxy";
+    else if (haProxyMode >= HaProxyMode::HaProxyClientVerification)
+        haproxy_s = "/HAProxySslClientVerification";
+
+    const std::string ssl_s = this->ioWrapper.isSsl() ? "/SSL" : "/Non-SSL";
     const std::string websocket_s = connectionProtocol == ConnectionProtocol::WebsocketMqtt ? "/Websocket" : "";
 
     transportStr = formatString("TCP%s%s%s", haproxy_s.c_str(), websocket_s.c_str(), ssl_s.c_str());
@@ -99,13 +111,13 @@ Client::Client(
 Client::~Client()
 {
     // Dummy clients, that I sometimes need just because the interface demands it but there's not actually a client, have no thread.
-    if (this->epoll_fd == 0)
+    if (this->epoll_fd < 0)
         return;
 
     if (disconnectReason.empty())
         disconnectReason = "not specified";
 
-    logger->logf(LOG_NOTICE, "Removing client '%s'. Reason(s): %s", repr().c_str(), disconnectReason.c_str());
+    logger->logf(disconnectReasonLogLevel, "Removing client '%s'. Reason(s): %s", repr().c_str(), disconnectReason.c_str());
 
     std::shared_ptr<ThreadData> td = this->threadData.lock();
 
@@ -123,7 +135,26 @@ Client::~Client()
     {
         if (epoll_ctl(this->epoll_fd, EPOLL_CTL_DEL, fd.get(), NULL) != 0)
             logger->logf(LOG_ERR, "Removing fd %d of client '%s' from epoll produced error: %s", fd.get(), repr().c_str(), strerror(errno));
+        this->epoll_fd = -1;
     }
+}
+
+void Client::addToEpoll(uint32_t events)
+{
+    if (this->epoll_fd > -1)
+        return;
+
+    auto owner_thread = threadData.lock();
+
+    if (!owner_thread)
+        return;
+
+    struct epoll_event ev{};
+    ev.data.fd = fd.get();
+    ev.events = events;
+    check<std::runtime_error>(epoll_ctl(owner_thread->getEpollFd(), EPOLL_CTL_ADD, fd.get(), &ev));
+
+    this->epoll_fd = owner_thread->getEpollFd();
 }
 
 bool Client::isSslAccepted() const
@@ -136,20 +167,24 @@ bool Client::isSsl() const
     return ioWrapper.isSsl();
 }
 
-bool Client::needsHaProxyParsing() const
+HaProxyStage Client::readHaProxyData()
 {
-    return ioWrapper.needsHaProxyParsing();
-}
+    assert(this->ioWrapper.getHaProxyStage() != HaProxyStage::DoneOrNotNeeded);
 
-HaProxyConnectionType Client::readHaProxyData()
-{
-    auto result = this->ioWrapper.readHaProxyData(this->fd.get());
-    const std::optional<FMQSockaddr> &new_sock_addr = std::get<std::optional<FMQSockaddr>>(result);
+    if (this->ioWrapper.getHaProxyStage() == HaProxyStage::HeaderPending)
+    {
+        const std::optional<FMQSockaddr> new_sock_addr = this->ioWrapper.readHaProxyHeader(this->fd.get());
 
-    if (new_sock_addr)
-        addr = new_sock_addr.value();
+        if (new_sock_addr)
+            addr = new_sock_addr.value();
+    }
 
-    return std::get<HaProxyConnectionType>(result);
+    if (this->ioWrapper.getHaProxyStage() == HaProxyStage::AdditionalBytesPending)
+    {
+        this->ioWrapper.readHaProxyAdditionalData(this->fd.get());
+    }
+
+    return this->getHaProxyStage();
 }
 
 bool Client::getSslReadWantsWrite() const
@@ -195,7 +230,7 @@ void Client::connectToBridgeTarget(FMQSockaddr addr)
     if (rc < 0)
     {
         if (errno != EINPROGRESS)
-           logger->logf(LOG_ERR, "Client connect error: %s", strerror(errno));
+           logger->logf(LOG_WARNING, "Client connect error: %s", strerror(errno));
         return;
     }
     assert(rc == 0);
@@ -330,8 +365,7 @@ PacketDropReason Client::writeMqttPacket(const MqttPacket &packet)
 
     if (packet.packetType == PacketType::PUBLISH)
     {
-        ThreadData *td = ThreadGlobals::getThreadData().get();
-        td->sentMessageCounter.inc();
+        ThreadGlobals::getThreadData()->sentMessageCounter.inc();
     }
     else if (packet.packetType == PacketType::DISCONNECT)
         setDisconnectStage(DisconnectStage::SendPendingAppData);
@@ -498,19 +532,26 @@ const FMQSockaddr &Client::getAddr() const
 
 std::string Client::repr()
 {
-    std::string bridge;
-
-    if (clientType == ClientType::Mqtt3DefactoBridge)
-        bridge = "Mqtt3Bridge ";
-    else if (clientType == ClientType::LocalBridge)
-        bridge = "LocalBridge ";
-
     std::string transport(this->transportStr);
 
     if (!ssl_version.empty())
     {
         transport = transport + " (" + ssl_version + ")";
     }
+
+    if (this->protocolVersion == ProtocolVersion::None)
+    {
+        std::ostringstream oss;
+        oss << "[fd=" << fd.get() << ", transport='" << transport << "', address='" << this->addr.getText() << "']";
+        return oss.str();
+    }
+
+    std::string bridge;
+
+    if (clientType == ClientType::Mqtt3DefactoBridge)
+        bridge = "Mqtt3Bridge ";
+    else if (clientType == ClientType::LocalBridge)
+        bridge = "LocalBridge ";
 
     std::string fmq_client_group_id_part;
 
@@ -776,6 +817,21 @@ void Client::setBridgeConnected()
         this->writeLoginPacket();
 }
 
+void Client::detectOutgoingConnectionEstablished()
+{
+    int error = 0;
+    socklen_t optlen = sizeof(int);
+    int rc = getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &error, &optlen);
+
+    if (rc == 0 && error == 0)
+    {
+        setBridgeConnected();
+    }
+
+    if (error > 0 && error != EINPROGRESS)
+        throw BadClientException(strerror(error), LOG_WARNING);
+}
+
 bool Client::getOutgoingConnectionEstablished() const
 {
     return this->outgoingConnectionEstablished;
@@ -960,8 +1016,11 @@ void Client::setClientProperties(
 
 void Client::setClientProperties(bool connectPacketSeen, uint16_t keepalive, uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue, bool supportsRetained)
 {
-    logger->log(LOG_DEBUG) << "Client '" << repr() << "' properties set: keep_alive=" << keepalive << ", max_outgoing_packet_size=" << maxOutgoingPacketSize
-                           << ", max_outgoing_topic_aliases=" << maxOutgoingTopicAliasValue << ".";
+    if (logger->wouldLog(LOG_DEBUG))
+    {
+        logger->log(LOG_DEBUG) << "Client '" << repr() << "' properties set: keep_alive=" << keepalive << ", max_outgoing_packet_size=" << maxOutgoingPacketSize
+                               << ", max_outgoing_topic_aliases=" << maxOutgoingTopicAliasValue << ".";
+    }
 
     this->connectPacketSeen = connectPacketSeen;
     this->keepalive = keepalive;
@@ -995,7 +1054,7 @@ std::shared_ptr<Session> Client::getSession()
     return this->session;
 }
 
-void Client::setDisconnectReason(const std::string &reason)
+void Client::setDisconnectReason(const std::string &reason, const int logLevel)
 {
 #ifndef TESTING // Because of testing trickery, we can't assert this in testing.
 #ifndef NDEBUG
@@ -1010,6 +1069,20 @@ void Client::setDisconnectReason(const std::string &reason)
     if (!this->disconnectReason.empty())
         this->disconnectReason += ", ";
     this->disconnectReason.append(reason);
+
+    // Purposefully disallow downgrading it again.
+    if (logLevel > this->disconnectReasonLogLevel)
+        this->disconnectReasonLogLevel = logLevel;
+}
+
+void Client::setDisconnectReasonFromSocketError()
+{
+    int error = 0;
+    socklen_t errlen = sizeof(error);
+    if (getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &error, &errlen) == 0)
+    {
+       setDisconnectReason(strerror(error));
+    }
 }
 
 /**
@@ -1112,12 +1185,14 @@ std::optional<std::string> Client::getUsernameFromPeerCertificate()
     if (!asn1_string)
         throw std::runtime_error("Cannot obtain asn1 string from x509 certificate.");
 
+    const auto len = ASN1_STRING_length(asn1_string);
     const unsigned char *str = ASN1_STRING_get0_data(asn1_string);
 
     if (!str)
         throw std::runtime_error("ASN1_STRING_get0_data failed. This should be impossible.");
 
-    std::string username(reinterpret_cast<const char*>(str));
+    std::vector<unsigned char> str_data(str, str + len);
+    std::string username = make_string(str_data, 0, len);
 
     if (!isValidUtf8(username))
         throw ProtocolError("Common name from peer certificate is not valid UTF8.", ReasonCodes::MalformedPacket);

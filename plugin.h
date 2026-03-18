@@ -42,11 +42,11 @@ enum class PasswordHashType
 struct MosquittoPasswordFileEntry
 {
     PasswordHashType type;
-    std::vector<char> salt;
-    std::vector<char> cryptedPassword;
+    std::vector<unsigned char> salt;
+    std::vector<unsigned char> cryptedPassword;
     int iterations = 0;
 
-    MosquittoPasswordFileEntry(PasswordHashType type, const std::vector<char> &&salt, const std::vector<char> &&cryptedPassword, int iterations);
+    MosquittoPasswordFileEntry(PasswordHashType type, const std::vector<unsigned char> &&salt, const std::vector<unsigned char> &&cryptedPassword, int iterations);
 
     // The plan was that objects of this type wouldn't be copied, but I can't get emplacing to work without it...?
     //MosquittoPasswordFileEntry(const MosquittoPasswordFileEntry &other) = delete;
@@ -111,11 +111,18 @@ typedef void(*F_flashmq_plugin_on_unsubscribe_v4)(
     const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
     const std::string &shareName, const std::vector<std::pair<std::string, std::string>> *userProperties);
 
-extern "C"
-{
-    // Gets called by the plugin, so it needs to exist, globally
-    void mosquitto_log_printf(int level, const char *fmt, ...);
-}
+typedef bool (*F_flashmq_plugin_alter_publish_v5)(
+    void *thread_data, const std::string &clientid, std::string &topic, const std::vector<std::string> &subtopics,
+    std::string_view payload, uint8_t &qos, bool &retain, std::optional<std::string> &correlationData,
+    std::optional<std::string> &responseTopic, std::optional<std::string> &contentType,
+    std::vector<std::pair<std::string, std::string>> *userProperties);
+typedef AuthResult(*F_flashmq_plugin_acl_check_v5)(
+    void *thread_data, const AclAccess access, const std::string &clientid, const std::string &username,
+    const std::string &topic, const std::vector<std::string> &subtopics, const std::string &sharename, std::string_view payload,
+    const uint8_t qos, const bool retain, const std::optional<std::string> &correlationData,
+    const std::optional<std::string> &responseTopic, const std::optional<std::string> &contentType,
+    const std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiresAt,
+    const std::vector<std::pair<std::string, std::string>> *userProperties);
 
 std::string AuthResultToString(AuthResult r);
 
@@ -157,6 +164,9 @@ class Authentication
     F_flashmq_plugin_acl_check_v4 flashmq_plugin_acl_check_v4 = nullptr;
     F_flashmq_plugin_on_unsubscribe_v4 flashmq_plugin_on_unsubscribe_v4 = nullptr;
 
+    F_flashmq_plugin_acl_check_v5 flashmq_plugin_acl_check_v5 = nullptr;
+    F_flashmq_plugin_alter_publish_v5 flashmq_plugin_alter_publish_v5 = nullptr;
+
     static std::mutex initMutex;
     static std::mutex deinitMutex;
     static std::mutex authChecksMutex;
@@ -185,7 +195,7 @@ class Authentication
     struct timespec mosquittoAclFileLastChange;
 
     std::unique_ptr<std::unordered_map<std::string, MosquittoPasswordFileEntry>> mosquittoPasswordEntries;
-    EVP_MD_CTX *mosquittoDigestContext = nullptr;
+    std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> mosquittoDigestContext;
     const EVP_MD *sha512 = EVP_sha512();
 
     AclTree aclTree;
@@ -195,7 +205,6 @@ public:
     Authentication(Settings &settings);
     Authentication(const Authentication &other) = delete;
     Authentication(Authentication &&other) = delete;
-    ~Authentication();
 
     void loadPlugin(const PluginLoader &l);
     void init();
@@ -210,7 +219,9 @@ public:
     AuthResult aclCheck(
             const std::string &clientid, const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
             const std::string &sharename, std::string_view payload, AclAccess access, uint8_t qos, bool retain, const std::optional<std::string> &correlationData,
-            const std::optional<std::string> &responseTopic, const std::vector<std::pair<std::string, std::string>> *userProperties);
+            const std::optional<std::string> &responseTopic, const std::optional<std::string> &contentType,
+            const std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiresAt,
+            const std::vector<std::pair<std::string, std::string>> *userProperties);
     AuthResult loginCheck(const std::string &clientid, const std::string &username, const std::string &password,
                           const std::vector<std::pair<std::string, std::string>> *userProperties, const std::weak_ptr<Client> &client, const bool allowAnonymous);
     AuthResult extendedAuth(const std::string &clientid, ExtendedAuthStage stage, const std::string &authMethod,
@@ -219,8 +230,8 @@ public:
     bool alterSubscribe(const std::string &clientid, std::string &topic, const std::vector<std::string> &subtopics, uint8_t &qos,
                         const std::vector<std::pair<std::string, std::string>> *userProperties);
     bool alterPublish(const std::string &clientid, std::string &topic, const std::vector<std::string> &subtopics, std::string_view payload,
-                      uint8_t &qos, bool &retain, const std::optional<std::string> &correlationData, const std::optional<std::string> &responseTopic,
-                      std::vector<std::pair<std::string, std::string>> *userProperties);
+                      uint8_t &qos, bool &retain, std::optional<std::string> &correlationData, std::optional<std::string> &responseTopic,
+                      std::optional<std::string> &contentType, std::vector<std::pair<std::string, std::string>> *userProperties);
     void clientDisconnected(const std::string &clientid);
     void fdReady(int fd, int events, const std::weak_ptr<void> &p);
 

@@ -122,7 +122,7 @@ void MainTests::initBeforeEachTest(const std::vector<std::string> &args, bool st
 
     // We test functions directly that the server normally only calls from worker threads, in which thread data is available. This is kind of a dummy-fix, until
     // we actually need correct thread data at those points (at this point, it's only to increase message counters).
-    this->dummyThreadData = std::make_shared<ThreadData>(666, settings, pluginLoader);
+    this->dummyThreadData = std::make_shared<ThreadData>(666, settings, pluginLoader, std::weak_ptr<MainApp>());
     ThreadGlobals::assignThreadData(dummyThreadData);
     ThreadGlobals::assignSettings(&this->settings);
 }
@@ -256,6 +256,7 @@ MainTests::MainTests()
     REGISTER_FUNCTION(testMqtt5DelayedWillsDisabled);
     REGISTER_FUNCTION3(testStringDistances);
     REGISTER_FUNCTION3(testConfigSuggestion);
+    REGISTER_FUNCTION3(testFlags);
     REGISTER_FUNCTION(testIncomingTopicAlias);
     REGISTER_FUNCTION(testOutgoingTopicAlias);
     REGISTER_FUNCTION(testOutgoingTopicAliasBeyondMax);
@@ -267,6 +268,7 @@ MainTests::MainTests()
     REGISTER_FUNCTION(testMessageExpiry);
     REGISTER_FUNCTION(testExpiredQueuedMessages);
     REGISTER_FUNCTION(testQoSPublishQueue);
+    REGISTER_FUNCTION3(testQoSPublishQueueMemoryLeak);
     REGISTER_FUNCTION3(testTimePointToAge);
     REGISTER_FUNCTION(testMosquittoPasswordFile);
     REGISTER_FUNCTION(testOverrideAllowAnonymousToTrue);
@@ -309,6 +311,7 @@ MainTests::MainTests()
     REGISTER_FUNCTION(testAlsoDontApproveOnErrorInPluginWithWildcardDenyMode);
     REGISTER_FUNCTION(testDenyWildcardSubscription);
     REGISTER_FUNCTION(testUserPropertiesPresent);
+    REGISTER_FUNCTION(testPublishInThread);
     REGISTER_FUNCTION(testPublishToItself);
     REGISTER_FUNCTION(testNoLocalPublishToItself);
     REGISTER_FUNCTION3(testTopicMatchingInSubscriptionTree);
@@ -329,6 +332,7 @@ MainTests::MainTests()
     REGISTER_FUNCTION3(testStringValuesInvalid);
     REGISTER_FUNCTION2(testPreviouslyValidConfigFile, false, false);
     REGISTER_FUNCTION3(testNoCopy);
+    REGISTER_FUNCTION3(testBase64);
     REGISTER_FUNCTION(testSessionTakeoverOtherUsername);
     REGISTER_FUNCTION(testCorrelationData);
     REGISTER_FUNCTION(testSubscriptionIdOnlineClient);
@@ -339,7 +343,7 @@ MainTests::MainTests()
     REGISTER_FUNCTION(testSubscriptionIdOverlappingSubscriptions);
 }
 
-bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, const std::vector<std::string> &tests)
+bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, bool abort_on_first_fail, const std::vector<std::string> &tests)
 {
     int testCount = 0;
     int testPassCount = 0;
@@ -371,6 +375,9 @@ bool MainTests::test(bool skip_tests_with_internet, bool skip_server_tests, cons
 
     for (const auto &pair : *selectedTests)
     {
+        if (abort_on_first_fail && testFailCount > 0)
+            break;
+
         const TestFunction &tf = pair.second;
 
         if (skip_tests_with_internet && tf.requiresInternet)

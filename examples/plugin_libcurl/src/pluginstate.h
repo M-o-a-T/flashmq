@@ -26,37 +26,35 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 */
 
+#ifndef PLUGINSTATE_H
+#define PLUGINSTATE_H
+
+#include <curl/curl.h>
+#include <stdint.h>
+#include <memory>
+#include <map>
+#include "vendor/flashmq_plugin.h"
 #include "authenticatingclient.h"
 
-AuthenticatingClient::AuthenticatingClient()
+// Use a name space to avoid obscure bugs when using type names FlashMQ uses too.
+namespace ExampleCurlPlugin
 {
-    eh = curl_easy_init();
+
+struct PluginState
+{
+    std::shared_ptr<CURLM> curlMulti;
+    uint32_t current_timer = 0;
+    std::map<std::weak_ptr<Client>, std::unique_ptr<AuthenticatingClient>, std::owner_less<std::weak_ptr<Client>>> networkAuthRequests;
+
+    PluginState();
+    ~PluginState();
+
+    void processNetworkAuthResult(std::weak_ptr<Client> &client, const std::string &answer);
+    void clearAllNetworkRequests();
+
+};
+
 }
 
-AuthenticatingClient::~AuthenticatingClient()
-{
-    cleanup();
-}
 
-void AuthenticatingClient::cleanup()
-{
-    if (curlMulti)
-    {
-        curl_multi_remove_handle(curlMulti, eh);
-        curlMulti = nullptr;
-    }
-
-    curl_easy_cleanup(eh);
-    eh = nullptr;
-}
-
-bool AuthenticatingClient::addToMulti(CURLM *curlMulti)
-{
-    if (curl_multi_add_handle(curlMulti, eh) != CURLM_OK)
-    {
-        cleanup();
-        return false;
-    }
-    this->curlMulti = curlMulti;
-    return true;
-}
+#endif // PLUGINSTATE_H

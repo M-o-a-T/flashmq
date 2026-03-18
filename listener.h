@@ -12,7 +12,6 @@ See LICENSE for license details.
 #define LISTENER_H
 
 #include <string>
-#include <memory>
 #include <optional>
 #include <vector>
 
@@ -46,13 +45,13 @@ struct Listener
     int port = 0;
     ConnectionProtocol connectionProtocol = ConnectionProtocol::Mqtt;
     bool tcpNoDelay = false;
-    bool haproxy = false;
+    HaProxyMode haProxyMode = HaProxyMode::Off;
     std::string sslFullchain;
     std::string sslPrivkey;
     std::string clientVerificationCaFile;
     std::string clientVerificationCaDir;
     bool clientVerifictionStillDoAuthn = false;
-    std::unique_ptr<SslCtxManager> sslctx;
+    std::optional<SslCtxManager> sslctx;
     AllowListenerAnonymous allowAnonymous = AllowListenerAnonymous::None;
     std::optional<std::string> acmeRedirectURL;
     TLSVersion minimumTlsVersion = TLSVersion::TLSv1_1;
@@ -66,7 +65,6 @@ struct Listener
 
     void isValid();
     bool isSsl() const;
-    bool isHaProxy() const;
     bool isTcpNoDelay() const;
     std::string getProtocolName() const;
     void loadCertAndKeyFromConfig();

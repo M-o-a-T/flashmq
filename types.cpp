@@ -171,12 +171,49 @@ Publish::Publish(const std::string &topic, const std::string &payload, uint8_t q
 
 }
 
+Publish::Publish(
+        const std::string &topic, const std::string &payload, uint8_t qos, bool retain, uint32_t expiryInterval,
+        const std::vector<std::pair<std::string, std::string>> *userProperties, const std::string *responseTopic,
+        const std::string *correlationData, const std::string *contentType) :
+    Publish(topic, payload, qos)
+{
+    this->retain = retain;
+
+    if (userProperties)
+    {
+        for (const std::pair<std::string, std::string> &pair : *userProperties)
+        {
+            this->addUserProperty(pair.first, pair.second);
+        }
+    }
+
+    if (expiryInterval)
+        this->setExpireAfter(expiryInterval);
+
+    if (responseTopic)
+        this->responseTopic = *responseTopic;
+
+    if (correlationData)
+        this->correlationData = *correlationData;
+
+    if (contentType)
+        this->contentType = *contentType;
+}
+
 bool Publish::hasExpired() const
 {
     if (!expireInfo)
         return false;
 
-    return (getAge<std::chrono::milliseconds>() > expireInfo->expiresAfter);
+    return expireInfo->expiresAt() < std::chrono::steady_clock::now();
+}
+
+std::optional<std::chrono::time_point<std::chrono::steady_clock>> Publish::expiresAt() const
+{
+    if (!expireInfo)
+        return {};
+
+    return expireInfo->expiresAt();
 }
 
 std::vector<std::pair<std::string, std::string>> *Publish::getUserProperties() const
@@ -428,35 +465,17 @@ std::string_view Connect::getMagicString() const
         return "MQTT";
 }
 
-Subscribe::Subscribe(const ProtocolVersion protocolVersion, uint16_t packetId, const std::string &topic, uint8_t qos) :
-    protocolVersion(protocolVersion),
-    packetId(packetId),
+Subscribe::Subscribe(const std::string &topic, uint8_t qos) :
     topic(topic),
     qos(qos)
 {
 
 }
 
-Unsubscribe::Unsubscribe(const ProtocolVersion protocolVersion, uint16_t packetId, const std::string &topic) :
-    protocolVersion(protocolVersion),
-    packetId(packetId),
+Unsubscribe::Unsubscribe(const std::string &topic) :
     topic(topic)
 {
 
-}
-
-size_t Unsubscribe::getLengthWithoutFixedHeader() const
-{
-    size_t result = topic.size() + 2;
-    result += 2; // packet id
-
-    if (this->protocolVersion >= ProtocolVersion::Mqtt5)
-    {
-        const size_t proplen = propertyBuilder ? propertyBuilder->getLength() : 1;
-        result += proplen;
-    }
-
-    return result;
 }
 
 std::chrono::time_point<std::chrono::steady_clock> PublishExpireInfo::expiresAt() const

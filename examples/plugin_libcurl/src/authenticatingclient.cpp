@@ -26,29 +26,29 @@ OTHER DEALINGS IN THE SOFTWARE.
 For more information, please refer to <http://unlicense.org/>
 */
 
-#ifndef AUTHENTICATINGCLIENT_H
-#define AUTHENTICATINGCLIENT_H
+#include <stdexcept>
+#include "authenticatingclient.h"
 
-#include <memory>
-#include <vector>
-
-#include "vendor/flashmq_plugin.h"
-#include "pluginstate.h"
-
-struct AuthenticatingClient
+ExampleCurlPlugin::AuthenticatingClient::AuthenticatingClient() :
+    easy_handle(curl_easy_init(), curl_easy_cleanup)
 {
-    PluginState *globalData;
-    std::weak_ptr<Client> client;
-    std::vector<char> response;
-    CURL *eh = nullptr; // Handle for our request.
-    CURLM *curlMulti = nullptr; // The multi handle we will be assigned to.
 
-    void cleanup();
+}
 
-    AuthenticatingClient();
-    ~AuthenticatingClient();
+ExampleCurlPlugin::AuthenticatingClient::~AuthenticatingClient()
+{
+    auto x = registeredAtMultiHandle.lock();
 
-    bool addToMulti(CURLM *curlMulti);
-};
+    if (x)
+    {
+        curl_multi_remove_handle(x.get(), easy_handle.get());
+    }
+}
 
-#endif // AUTHENTICATINGCLIENT_H
+void ExampleCurlPlugin::AuthenticatingClient::addToMulti(std::shared_ptr<CURLM> &curlMulti)
+{
+    if (curl_multi_add_handle(curlMulti.get(), easy_handle.get()) != CURLM_OK)
+        throw std::runtime_error("curl_multi_add_handle failed");
+
+    registeredAtMultiHandle = curlMulti;
+}

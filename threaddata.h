@@ -23,6 +23,7 @@ See LICENSE for license details.
 #include <chrono>
 #include <forward_list>
 #include <random>
+#include <atomic>
 
 #include "client.h"
 #include "plugin.h"
@@ -34,6 +35,9 @@ See LICENSE for license details.
 #include "driftcounter.h"
 #include "fdmanaged.h"
 #include "mutexowned.h"
+#include "clientacceptqueue.h"
+
+class MainApp;
 
 struct KeepAliveCheck
 {
@@ -66,7 +70,7 @@ struct ThreadDataOwner
     ThreadDataOwner() = delete;
     ThreadDataOwner(const ThreadDataOwner &other) = delete;
     ThreadDataOwner(ThreadDataOwner &&other) = default;
-    ThreadDataOwner(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader);
+    ThreadDataOwner(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader, const std::weak_ptr<MainApp> mainApp);
     ~ThreadDataOwner();
 
     ThreadDataOwner &operator=(const ThreadDataOwner &other) = delete;
@@ -81,11 +85,11 @@ struct ThreadDataOwner
 class ThreadData
 {
     FdManaged epollfd;
-    MutexOwned<Clients> clients;
+    Clients clients;
     Logger *logger;
 
-    MutexOwned<std::forward_list<std::weak_ptr<Client>>> clientsQueuedForRemoving;
-    MutexOwned<std::map<std::chrono::seconds, std::vector<KeepAliveCheck>>> queuedKeepAliveChecks;
+    std::forward_list<std::weak_ptr<Client>> clientsQueuedForRemoving;
+    std::map<std::chrono::seconds, std::vector<KeepAliveCheck>> queuedKeepAliveChecks;
 
     std::list<QueuedRetainedMessage> queuedRetainedMessages;
 
@@ -96,15 +100,13 @@ class ThreadData
     void doKeepAliveCheck();
     void quit();
     void publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadData>> &threads);
-    void publishStat(const std::string &topic, uint64_t n);
+    void publishStat(const std::string &topic, int64_t n);
     void sendQueuedWills();
     void removeExpiredSessions();
     void purgeSubscriptionTree();
     void removeExpiredRetainedMessages();
     void sendAllWills();
     void sendAllDisconnects();
-    void queueClientNextKeepAliveCheck(
-        std::shared_ptr<Client> &client, bool keepRechecking, MutexLocked<std::map<std::chrono::seconds, std::vector<KeepAliveCheck>>> &queued_checks_locked);
     void clientDisconnectEvent(const std::string &clientid);
     void clientDisconnectActions(
             bool authenticated, const std::string &clientid, std::shared_ptr<WillPublish> &willPublish, std::shared_ptr<Session> &session,
@@ -118,18 +120,22 @@ class ThreadData
 public:
     Settings settingsLocalCopy; // Is updated on reload, within the thread loop.
     Authentication authentication;
+    bool deferThreadReady = false;
     bool running = true;
     bool finished = false;
     bool allWillsQueued = false;
-    pthread_t thread_id = 0;
+    pthread_t thread_id = pthread_self(); // Gets set later, but this helps asserts dummy use in fuzzing and tests.
     int threadnr = 0;
     int taskEventFd = -1;
     int disconnectingAllEventFd = -1;
+    std::atomic<size_t> clientCount{0};
     MutexOwned<std::list<std::function<void()>>> taskQueue;
     QueuedTasks delayedTasks;
     DriftCounter driftCounter;
     std::unordered_map<int, std::weak_ptr<void>> externalFds;
     std::vector<std::weak_ptr<Client>> disconnectingClients;
+    ClientAcceptQueue acceptQueue;
+    std::weak_ptr<MainApp> mMainApp;
 
     DerivableCounter receivedMessageCounter;
     DerivableCounter sentMessageCounter;
@@ -144,7 +150,7 @@ public:
 
     std::minstd_rand randomish;
 
-    ThreadData(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader);
+    ThreadData(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader, const std::weak_ptr<MainApp> mainApp);
     ThreadData(const ThreadData &other) = delete;
     ThreadData(ThreadData &&other) = delete;
     ~ThreadData();
@@ -174,7 +180,8 @@ public:
     void queueRemoveExpiredRetainedMessages();
     void queueClientNextKeepAliveCheck(std::shared_ptr<Client> &client, bool keepRechecking);
     void continuationOfAuthentication(std::shared_ptr<Client> &client, AuthResult authResult, const std::string &authMethod, const std::string &returnData);
-    void queueContinuationOfAuthentication(const std::shared_ptr<Client> &client, AuthResult authResult, const std::string &authMethod, const std::string &returnData);
+    void queueContinuationOfAuthentication(
+            const std::shared_ptr<Client> &client, AuthResult authResult, const std::string &authMethod, const std::string &returnData, const uint32_t delay_in_ms);
     void queueClientDisconnectActions(
             bool authenticated, const std::string &clientid, std::shared_ptr<WillPublish> &&willPublish, std::shared_ptr<Session> &&session,
             std::weak_ptr<BridgeState> &&bridgeState, const std::string &disconnect_reason);
@@ -184,8 +191,12 @@ public:
     void setQueuedRetainedMessages();
     bool queuedRetainedMessagesEmpty() const;
     void clearQueuedRetainedMessages();
+    void acceptPendingClients();
+    void acceptPendingBridges();
+    void deleteClients();
 
-    int getNrOfClients();
+    size_t getNrOfClients();
+    void updateNrOfClients();
 
     void queuepluginPeriodicEvent();
     void pluginPeriodicEvent();
@@ -200,6 +211,7 @@ public:
     void removeDelayedTask(uint32_t id);
 
     void addImmediateTask(std::function<void()> f);
+    void performAllImmediateTasks();
 };
 
 

@@ -115,6 +115,7 @@ class Client
     ClientType clientType = ClientType::Normal;
     bool supportsRetained = true; // Interestingly, only SERVERS can tell CLIENTS they don't support it (in CONNACK). The CONNECT packet has no field for it.
     std::string disconnectReason;
+    int disconnectReasonLogLevel = LOG_NOTICE;
     std::chrono::time_point<std::chrono::steady_clock> lastActivity = std::chrono::steady_clock::now();
 
     std::string ssl_version;
@@ -125,14 +126,15 @@ class Client
     bool clean_start = false;
     X509ClientVerification x509ClientVerification = X509ClientVerification::None;
     AllowListenerAnonymous allowAnonymousOverride = AllowListenerAnonymous::None;
+    HaProxyMode mHaProxyMode = HaProxyMode::Off;
 
     std::unique_ptr<std::string> acmeRedirectUrl;
 
     std::shared_ptr<WillPublish> stagedWillPublish;
     std::shared_ptr<WillPublish> willPublish;
 
-    const int epoll_fd;
-    std::weak_ptr<ThreadData> threadData; // The thread (data) that this client 'lives' in.
+    int epoll_fd = -1;
+    LockedWeakPtr<ThreadData> threadData; // The thread (data) that this client 'lives' in.
 
     std::shared_ptr<Session> session;
 
@@ -164,17 +166,21 @@ public:
     uint8_t preAuthPacketCounter = 0;
 
     Client(
-        ClientType type, int fd, std::shared_ptr<ThreadData> threadData, FmqSsl &&ssl, ConnectionProtocol connectionProtocol, bool haproxy,
+        ClientType type, int fd, std::shared_ptr<ThreadData> threadData, FmqSsl &&ssl, ConnectionProtocol connectionProtocol, HaProxyMode haProxyMode,
         const struct sockaddr *addr, const Settings &settings, bool fuzzMode=false);
     Client(const Client &other) = delete;
     Client(Client &&other) = delete;
     ~Client();
 
+    void addToEpoll(uint32_t events);
     int getFd() { return fd.get();}
     bool isSslAccepted() const;
     bool isSsl() const;
-    bool needsHaProxyParsing() const;
-    HaProxyConnectionType readHaProxyData();
+    const std::optional<std::string> &getHaProxySslCnName() const { return this->ioWrapper.getHaProxySslCnName(); }
+    HaProxyMode getHaProxyMode() const { return this->mHaProxyMode; }
+    HaProxyStage getHaProxyStage() const { return this->ioWrapper.getHaProxyStage();};
+    HaProxyConnectionType getHaProxyConnectionType() const { return this->ioWrapper.getHaProxyConnectionType(); }
+    HaProxyStage readHaProxyData();
     bool getSslReadWantsWrite() const;
     bool getSslWriteWantsRead() const;
     ProtocolVersion getProtocolVersion() const;
@@ -211,7 +217,8 @@ public:
     const std::shared_ptr<WillPublish> &getStagedWill() { return this->stagedWillPublish; }
     void assignSession(const std::shared_ptr<Session> &session);
     std::shared_ptr<Session> getSession();
-    void setDisconnectReason(const std::string &reason);
+    void setDisconnectReason(const std::string &reason, const int logLevel=-1);
+    void setDisconnectReasonFromSocketError();
     std::chrono::seconds getSecondsTillKeepAliveAction() const;
     const std::optional<std::string> &getLocalPrefix() const;
     const std::optional<std::string> &getRemotePrefix() const;
@@ -261,6 +268,7 @@ public:
     bool isOutgoingConnection() const;
     std::shared_ptr<BridgeState> getBridgeState();
     void setBridgeConnected();
+    void detectOutgoingConnectionEstablished();
     bool getOutgoingConnectionEstablished() const;
     ClientType getClientType() const { return clientType; }
     void setClientType(ClientType val);

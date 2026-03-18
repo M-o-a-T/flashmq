@@ -30,16 +30,7 @@ std::mutex Authentication::initMutex;
 std::mutex Authentication::deinitMutex;
 std::mutex Authentication::authChecksMutex;
 
-void mosquitto_log_printf(int level, const char *fmt, ...)
-{
-    Logger *logger = Logger::getInstance();
-    va_list valist;
-    va_start(valist, fmt);
-    logger->logf(level, fmt, valist);
-    va_end(valist);
-}
-
-MosquittoPasswordFileEntry::MosquittoPasswordFileEntry(PasswordHashType type, const std::vector<char> &&salt, const std::vector<char> &&cryptedPassword, int iterations) :
+MosquittoPasswordFileEntry::MosquittoPasswordFileEntry(PasswordHashType type, const std::vector<unsigned char> &&salt, const std::vector<unsigned char> &&cryptedPassword, int iterations) :
     type(type),
     salt(salt),
     cryptedPassword(cryptedPassword),
@@ -53,7 +44,7 @@ Authentication::Authentication(Settings &settings) :
     settings(settings),
     mosquittoPasswordFile(settings.mosquittoPasswordFile),
     mosquittoAclFile(settings.mosquittoAclFile),
-    mosquittoDigestContext(EVP_MD_CTX_new())
+    mosquittoDigestContext(EVP_MD_CTX_new(), EVP_MD_CTX_free)
 {
     logger = Logger::getInstance();
 
@@ -62,14 +53,8 @@ Authentication::Authentication(Settings &settings) :
         throw std::runtime_error("Failed to initialize SHA512 for decoding auth entry");
     }
 
-    EVP_DigestInit_ex(mosquittoDigestContext, sha512, NULL);
+    EVP_DigestInit_ex(mosquittoDigestContext.get(), sha512, NULL);
     memset(&mosquittoPasswordFileLastLoad, 0, sizeof(struct timespec));
-}
-
-Authentication::~Authentication()
-{
-    EVP_MD_CTX_free(mosquittoDigestContext);
-    mosquittoDigestContext = nullptr;
 }
 
 void *Authentication::loadSymbol(void *handle, const char *symbol, bool exceptionOnError) const
@@ -137,6 +122,12 @@ void Authentication::loadPlugin(const PluginLoader &l)
         {
             flashmq_plugin_acl_check_v4 = (F_flashmq_plugin_acl_check_v4)l.loadSymbol("flashmq_plugin_acl_check");
             flashmq_plugin_alter_publish_v3 = (F_flashmq_plugin_alter_publish_v3)l.loadSymbol("flashmq_plugin_alter_publish", false);
+            flashmq_plugin_on_unsubscribe_v4 = (F_flashmq_plugin_on_unsubscribe_v4)l.loadSymbol("flashmq_plugin_on_unsubscribe", false);
+        }
+        else if (flashmqPluginVersionNumber == 5)
+        {
+            flashmq_plugin_acl_check_v5 = (F_flashmq_plugin_acl_check_v5)l.loadSymbol("flashmq_plugin_acl_check");
+            flashmq_plugin_alter_publish_v5 = (F_flashmq_plugin_alter_publish_v5)l.loadSymbol("flashmq_plugin_alter_publish", false);
             flashmq_plugin_on_unsubscribe_v4 = (F_flashmq_plugin_on_unsubscribe_v4)l.loadSymbol("flashmq_plugin_on_unsubscribe", false);
         }
         else
@@ -326,7 +317,8 @@ AuthResult Authentication::aclCheck(Publish &publishData, std::string_view paylo
 {
     AuthResult result = aclCheck(
         publishData.client_id, publishData.username, publishData.topic, publishData.getSubtopics(), "", payload, access, publishData.qos,
-        publishData.retain, publishData.correlationData, publishData.responseTopic, publishData.getUserProperties());
+        publishData.retain, publishData.correlationData, publishData.responseTopic, publishData.contentType, publishData.expiresAt(),
+        publishData.getUserProperties());
 
     // Anonymous publishes come from FlashMQ internally, like SYS topics. We need to allow them.
     if (access == AclAccess::write && publishData.client_id.empty())
@@ -338,7 +330,9 @@ AuthResult Authentication::aclCheck(Publish &publishData, std::string_view paylo
 AuthResult Authentication::aclCheck(
         const std::string &clientid, const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
         const std::string &sharename, std::string_view payload, AclAccess access, uint8_t qos, bool retain, const std::optional<std::string> &correlationData,
-        const std::optional<std::string> &responseTopic, const std::vector<std::pair<std::string, std::string>> *userProperties)
+        const std::optional<std::string> &responseTopic, const std::optional<std::string> &contentType,
+        const std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiresAt,
+        const std::vector<std::pair<std::string, std::string>> *userProperties)
 {
     assert(subtopics.size() > 0);
 #ifdef TESTING
@@ -347,7 +341,7 @@ AuthResult Authentication::aclCheck(
     assert(retain || access == AclAccess::subscribe || !payload.empty());
 #endif
 
-    ThreadData *threadData = ThreadGlobals::getThreadData().get();
+    auto &threadData = ThreadGlobals::getThreadData();
 
     switch (access)
     {
@@ -391,7 +385,13 @@ AuthResult Authentication::aclCheck(
         // gets disconnected.
         try
         {
-            if (flashmqPluginVersionNumber == 4)
+            if (flashmqPluginVersionNumber == 5)
+            {
+                return flashmq_plugin_acl_check_v5(
+                    pluginData, access, clientid, username, topic, subtopics, sharename, payload, qos, retain,
+                    correlationData, responseTopic, contentType, expiresAt, userProperties);
+            }
+            else if (flashmqPluginVersionNumber == 4)
             {
                 return flashmq_plugin_acl_check_v4(
                     pluginData, access, clientid, username, topic, subtopics, sharename, payload, qos, retain,
@@ -579,8 +579,8 @@ bool Authentication::alterSubscribe(const std::string &clientid, std::string &to
 
 bool Authentication::alterPublish(
     const std::string &clientid, std::string &topic, const std::vector<std::string> &subtopics, std::string_view payload,
-    uint8_t &qos, bool &retain, const std::optional<std::string> &correlationData,
-    const std::optional<std::string> &responseTopic,
+    uint8_t &qos, bool &retain, std::optional<std::string> &correlationData,
+    std::optional<std::string> &responseTopic, std::optional<std::string> &contentType,
     std::vector<std::pair<std::string, std::string>> *userProperties)
 {
 #ifdef TESTING
@@ -604,7 +604,14 @@ bool Authentication::alterPublish(
     {
         try
         {
-            if (flashmqPluginVersionNumber == 3 || flashmqPluginVersionNumber == 4)
+            if (flashmqPluginVersionNumber == 5)
+            {
+                if (flashmq_plugin_alter_publish_v5)
+                    return flashmq_plugin_alter_publish_v5(
+                        pluginData, clientid, topic, subtopics, payload, qos, retain,
+                        correlationData, responseTopic, contentType, userProperties);
+            }
+            else if (flashmqPluginVersionNumber == 3 || flashmqPluginVersionNumber == 4)
             {
                 if (flashmq_plugin_alter_publish_v3)
                     return flashmq_plugin_alter_publish_v3(pluginData, clientid, topic, subtopics, payload, qos, retain,
@@ -772,8 +779,8 @@ void Authentication::loadMosquittoPasswordFile()
                     throw std::runtime_error("Password fields must start with $6$ or $7$");
                 }
 
-                std::vector<char> salt = base64Decode(fields2[saltField]);
-                std::vector<char> cryptedPassword = base64Decode(fields2[hashField]);
+                std::vector<unsigned char> salt = base64Decode(fields2[saltField]);
+                std::vector<unsigned char> cryptedPassword = base64Decode(fields2[hashField]);
                 passwordEntries_tmp->emplace(username, MosquittoPasswordFileEntry(type, std::move(salt), std::move(cryptedPassword), iterations));
             }
             catch (std::exception &ex)
@@ -911,32 +918,28 @@ std::optional<AuthResult> Authentication::loginCheckFromMosquittoPasswordFile(co
 
         if (entry.type == PasswordHashType::SHA512)
         {
-
-            unsigned char md_value[EVP_MAX_MD_SIZE];
+            std::array<unsigned char, EVP_MAX_MD_SIZE> md_value;
             unsigned int output_len = 0;
 
-            EVP_MD_CTX_reset(mosquittoDigestContext);
-            EVP_DigestInit_ex(mosquittoDigestContext, sha512, NULL);
-            EVP_DigestUpdate(mosquittoDigestContext, password.c_str(), password.length());
-            EVP_DigestUpdate(mosquittoDigestContext, entry.salt.data(), entry.salt.size());
-            EVP_DigestFinal_ex(mosquittoDigestContext, md_value, &output_len);
+            EVP_MD_CTX_reset(mosquittoDigestContext.get());
+            EVP_DigestInit_ex(mosquittoDigestContext.get(), sha512, NULL);
+            EVP_DigestUpdate(mosquittoDigestContext.get(), password.c_str(), password.length());
+            EVP_DigestUpdate(mosquittoDigestContext.get(), entry.salt.data(), entry.salt.size());
+            EVP_DigestFinal_ex(mosquittoDigestContext.get(), md_value.data(), &output_len);
 
-            std::vector<char> hashedSalted(output_len);
-            std::memcpy(hashedSalted.data(), md_value, output_len);
+            std::vector<unsigned char> hashedSalted = make_vector<unsigned char>(md_value, 0, output_len);
 
             if (hashedSalted == entry.cryptedPassword)
                 result = AuthResult::success;
         }
         else if (entry.type == PasswordHashType::SHA512_pbkdf2)
         {
-            unsigned char md_value[EVP_MAX_MD_SIZE];
+            const auto len = EVP_MD_size(this->sha512);
+            std::array<unsigned char, EVP_MAX_MD_SIZE> md_value;
 
-            const unsigned char *saltData = reinterpret_cast<const unsigned char*>(entry.salt.data());
+            PKCS5_PBKDF2_HMAC(password.c_str(), password.size(), entry.salt.data(), entry.salt.size(), entry.iterations, sha512, md_value.size(), md_value.data());
 
-            PKCS5_PBKDF2_HMAC(password.c_str(), password.size(), saltData, entry.salt.size(), entry.iterations, sha512, EVP_MAX_MD_SIZE, md_value);
-
-            std::vector<char> derivedKey(EVP_MAX_MD_SIZE);
-            std::memcpy(derivedKey.data(), md_value, EVP_MAX_MD_SIZE);
+            std::vector<unsigned char> derivedKey = make_vector<unsigned char>(md_value, 0, len);
 
             if (derivedKey == entry.cryptedPassword)
                 result = AuthResult::success;

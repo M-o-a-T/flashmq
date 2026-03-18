@@ -36,6 +36,7 @@ For more information, please refer to <http://unlicense.org/>
 #include "curl_functions.h"
 #include "authenticatingclient.h"
 
+using namespace ExampleCurlPlugin;
 
 int flashmq_plugin_version()
 {
@@ -121,14 +122,15 @@ void flashmq_plugin_poll_event_received(void *thread_data, int fd, uint32_t even
     }
 
     int n = -1;
-    curl_multi_socket_action(s->curlMulti, fd, new_events, &n);
+    curl_multi_socket_action(s->curlMulti.get(), fd, new_events, &n);
 
-    check_all_active_curls(s->curlMulti);
+    check_all_active_curls(s, s->curlMulti.get());
 }
 
 
-AuthResult flashmq_plugin_login_check(void *thread_data, const std::string &clientid, const std::string &username, const std::string &password,
-                                      const std::vector<std::pair<std::string, std::string>> *userProperties, const std::weak_ptr<Client> &client)
+AuthResult flashmq_plugin_login_check(
+    void *thread_data, const std::string &clientid, const std::string &username, const std::string &password,
+    const std::vector<std::pair<std::string, std::string>> *userProperties, const std::weak_ptr<Client> &client)
 {
     (void)clientid;
     (void)userProperties;
@@ -144,27 +146,25 @@ AuthResult flashmq_plugin_login_check(void *thread_data, const std::string &clie
     if (username == "curl")
     {
         PluginState *state = static_cast<PluginState*>(thread_data);
+        std::unique_ptr<AuthenticatingClient> &c = state->networkAuthRequests[client];
 
-        // Libcurl is C, so we unfortunately have to use naked new and hope we'll delete it in all the right places.
-        AuthenticatingClient *c = new AuthenticatingClient;
+        if (c)
+            throw std::runtime_error("Client already doing an authentication");
+
+        c = std::make_unique<AuthenticatingClient>();
         c->client = client;
-        c->globalData = state;
 
-        curl_easy_setopt(c->eh, CURLOPT_WRITEFUNCTION, curl_write_cb); // The function that is called when curl has data from the response for us.
-        curl_easy_setopt(c->eh, CURLOPT_WRITEDATA, c); // The pointer set we get in the above function.
-        curl_easy_setopt(c->eh, CURLOPT_PRIVATE, c); // The pointer set we get back with 'curl_easy_getinfo', for when the request is finished.
+        curl_easy_setopt(c->easy_handle.get(), CURLOPT_WRITEFUNCTION, curl_write_cb); // The function that is called when curl has data from the response for us.
+        curl_easy_setopt(c->easy_handle.get(), CURLOPT_WRITEDATA, c.get()); // The pointer set we get in the above function.
+        curl_easy_setopt(c->easy_handle.get(), CURLOPT_PRIVATE, c.get()); // The pointer set we get back with 'curl_easy_getinfo', for when the request is finished.
 
         flashmq_logf(LOG_INFO, "Asking an HTTP server");
 
         // Keep in mind that DNS resovling may be blocking too. You could perhaps resolve the DNS once and use the result. But,
         // libcurl actually has some DNS caching as well.
-        curl_easy_setopt(c->eh, CURLOPT_URL, "http://www.google.com/");
+        curl_easy_setopt(c->easy_handle.get(), CURLOPT_URL, "http://www.google.com/");
 
-        if (!c->addToMulti(state->curlMulti))
-        {
-            delete c;
-            return AuthResult::error;
-        }
+        c->addToMulti(state->curlMulti);
 
         return AuthResult::async;
     }
@@ -173,20 +173,19 @@ AuthResult flashmq_plugin_login_check(void *thread_data, const std::string &clie
 
 }
 
-AuthResult flashmq_plugin_acl_check(void *thread_data, const AclAccess access, const std::string &clientid, const std::string &username,
-                                    const std::string &topic, const std::vector<std::string> &subtopics, std::string_view payload, const uint8_t qos,
-                                    const bool retain, const std::vector<std::pair<std::string, std::string>> *userProperties)
+AuthResult flashmq_plugin_acl_check(
+    void *thread_data, const AclAccess access, const std::string &clientid, const std::string &username,
+    const std::string &topic, const std::vector<std::string> &subtopics, const std::string &shareName,
+    std::string_view payload, const uint8_t qos, const bool retain,
+    const std::optional<std::string> &correlationData, const std::optional<std::string> &responseTopic,
+    const std::optional<std::string> &contentType,
+    const std::optional<std::chrono::time_point<std::chrono::steady_clock>> expiresAt,
+    const std::vector<std::pair<std::string, std::string>> *userProperties)
 {
-    (void)thread_data;
-    (void)access;
-    (void)clientid;
-    (void)username;
-    (void)subtopics;
-    (void)qos;
-    (void)(retain);
-    (void)userProperties;
-    (void)topic;
-    (void)payload;
+    (void)thread_data; (void)access; (void)clientid; (void)username; (void)topic; (void)subtopics; (void)shareName;
+    (void)payload; (void)qos; (void)retain; (void)correlationData; (void)responseTopic;
+    (void)contentType; (void) expiresAt; (void)userProperties;
+
 
     return AuthResult::success;
 }

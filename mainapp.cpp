@@ -13,7 +13,6 @@ See LICENSE for license details.
 #include "exceptions.h"
 #include <getopt.h>
 #include <unistd.h>
-#include <stdio.h>
 #include <sys/sysinfo.h>
 #include <arpa/inet.h>
 #include <memory>
@@ -33,8 +32,8 @@ See LICENSE for license details.
 #include "bridgeinfodb.h"
 #include "globals.h"
 #include "fmqssl.h"
-
-MainApp *MainApp::instance = nullptr;
+#include "persistencefunctions.h"
+#include "sdnotify.h"
 
 MainApp::MainApp(const std::string &configFilePath)
 {
@@ -63,6 +62,12 @@ MainApp::MainApp(const std::string &configFilePath)
 
     if (!settings.storageDir.empty())
     {
+        try
+        {
+            correctBackupDbPermissions(settings.storageDir);
+        }
+        catch (std::exception &ex) {}
+
         const std::string retainedDbPath = settings.getRetainedMessagesDBFile();
         if (settings.retainedMessagesMode == RetainedMessagesMode::Enabled)
             subscriptionStore->loadRetainedMessages(settings.getRetainedMessagesDBFile());
@@ -88,6 +93,15 @@ void MainApp::doHelp(const char *arg)
 {
     puts("FlashMQ - the scalable light-weight MQTT broker");
     puts("");
+    puts("Documentation:");
+    puts("  'man 5 flashmq.conf' or https://www.flashmq.org/man/flashmq.conf.5");
+    puts("  'man 1 flashmq' or https://www.flashmq.org/man/flashmq.1");
+    puts("");
+    puts("Signals:");
+    puts("  SIGHUP: reload configuration.");
+    puts("  SIGUSR1: reopen log files.");
+    puts("  SIGUSR2: perform malloc_trim(), to try to yield unused heap memory to the OS.");
+    puts("");
     printf("Usage: %s [options]\n", arg);
     puts("");
     puts(" -h, --help                           Print help");
@@ -112,13 +126,13 @@ void MainApp::showLicense()
 #endif
 
     printf("FlashMQ Version %s %s\n", FLASHMQ_VERSION, sse.c_str());
-    puts("Copyright (C) 2021-2025 Wiebe Cazemier.");
+    puts("Copyright (C) 2021-2026 Wiebe Cazemier.");
     puts("License OSL3: Open Software License 3.0 <https://opensource.org/license/osl-3-0-php/>.");
     puts("");
     puts("Author: Wiebe Cazemier <wiebe@flashmq.org>");
 }
 
-std::list<ScopedSocket> MainApp::createListenSocket(const std::shared_ptr<Listener> &listener)
+std::list<ScopedSocket> MainApp::createListenSocket(const std::shared_ptr<Listener> &listener, bool do_listen)
 {
     std::list<ScopedSocket> result;
 
@@ -172,13 +186,13 @@ std::list<ScopedSocket> MainApp::createListenSocket(const std::shared_ptr<Listen
             {
                 logtext << "Creating " << pname << " " << listener->getProtocolName() << " ";
 
-                if (listener->haproxy)
+                if (listener->haProxyMode == HaProxyMode::On)
                     logtext << "haproxy ";
+                else if (listener->haProxyMode >= HaProxyMode::HaProxyClientVerification)
+                    logtext << "haproxy with client verification";
 
                 logtext << "listener on [" << listener->getBindAddress(p) << "]:" << listener->port;
             }
-
-            logger->log(LOG_NOTICE) << logtext.str();
 
             BindAddr bindAddr(family, listener->getBindAddress(p), listener->port, listener->unixSocketUser, listener->unixSocketGroup, listener->unixSocketMode);
 
@@ -205,14 +219,12 @@ std::list<ScopedSocket> MainApp::createListenSocket(const std::shared_ptr<Listen
             check<std::runtime_error>(fcntl(uniqueListenFd.get(), F_SETFL, flags | O_NONBLOCK ));
 
             bindAddr.bind_socket(uniqueListenFd.get());
-            check<std::runtime_error>(listen(uniqueListenFd.get(), 32768));
+            uniqueListenFd.setListenMessage(logtext.str());
 
-            struct epoll_event ev;
-            memset(&ev, 0, sizeof (struct epoll_event));
-
-            ev.data.fd = uniqueListenFd.get();
-            ev.events = EPOLLIN;
-            check<std::runtime_error>(epoll_ctl(this->epollFdAccept, EPOLL_CTL_ADD, uniqueListenFd.get(), &ev));
+            if (do_listen)
+            {
+                uniqueListenFd.doListen(this->epollFdAccept);
+            }
 
             result.push_back(std::move(uniqueListenFd));
         }
@@ -233,6 +245,22 @@ void MainApp::wakeUpThread()
 {
     uint64_t one = 1;
     check<std::runtime_error>(write(taskEventFd, &one, sizeof(uint64_t)));
+}
+
+void MainApp::addImmediateTask(std::function<void ()> f)
+{
+    bool wakeupNeeded = true;
+
+    {
+        auto task_queue_locked = taskQueue.lock();
+        wakeupNeeded = task_queue_locked->empty();
+        task_queue_locked->push_back(std::move(f));
+    }
+
+    if (wakeupNeeded)
+    {
+        wakeUpThread();
+    }
 }
 
 void MainApp::queueKeepAliveCheckAtAllThreads()
@@ -289,7 +317,7 @@ void MainApp::saveStateInThread()
 {
     std::list<BridgeInfoForSerializing> bridgeInfos = BridgeInfoForSerializing::getBridgeInfosForSerializing(this->bridgeConfigs);
 
-    auto f = std::bind(&MainApp::saveState, this->settings, bridgeInfos, true);
+    auto f = std::bind(&saveState, this->settings, bridgeInfos, true);
     this->bgWorker.addTask(f, true);
 }
 
@@ -328,7 +356,8 @@ void MainApp::sendBridgesToThreads()
     if (threads.empty())
         return;
 
-    int i = 0;
+    size_t i1 = 0;
+    size_t i2 = 0;
     auto bridge_pos = this->bridgeConfigs.begin();
     while (bridge_pos != this->bridgeConfigs.end())
     {
@@ -341,7 +370,14 @@ void MainApp::sendBridgesToThreads()
 
         if (!owner)
         {
-            owner = threads.at(i++ % threads.size()).getThreadData();
+            size_t index = 0;
+
+            if (bridge.getFmqClientGroupId())
+                index = i1++;
+            else
+                index = i2++;
+
+            owner = threads.at(index % threads.size()).getThreadData();
             bridge.owner = owner;
         }
 
@@ -359,7 +395,7 @@ void MainApp::sendBridgesToThreads()
     }
 }
 
-void MainApp::queueBridgeReconnectAllThreads(bool alsoQueueNexts)
+void MainApp::queueBridgeReconnectAllThreads()
 {
     try
     {
@@ -372,12 +408,6 @@ void MainApp::queueBridgeReconnectAllThreads(bool alsoQueueNexts)
     {
         Logger *logger = Logger::getInstance();
         logger->logf(LOG_ERR, ex.what());
-    }
-
-    if (alsoQueueNexts)
-    {
-        auto fReconnectBridges = std::bind(&MainApp::queueBridgeReconnectAllThreads, this, false);
-        timed_tasks.addTask(fReconnectBridges, 5000, true);
     }
 }
 
@@ -416,98 +446,31 @@ void MainApp::queueInternalHeartbeat()
     }
 }
 
-/**
- * @brief MainApp::saveState saves sessions and such to files. It's run in the main thread, but also dedicated threads. For that,
- * reason, it's a static method to reduce the risk of accidental use of data without locks.
- * @param settings A local settings, copied from a std::bind copy when running in a thread, because of thread safety.
- * @param bridgeInfos is a list of objects already prepared from the original bridge configs, to avoid concurrent access.
- */
-void MainApp::saveState(const Settings &settings, const std::list<BridgeInfoForSerializing> &bridgeInfos, bool in_background)
+void MainApp::performAllImmediateTasks()
 {
-    Logger *logger = Logger::getInstance();
+    std::vector<std::function<void()>> copiedTasks;
 
-    try
     {
-        if (!settings.storageDir.empty())
+        auto task_queue_locked = taskQueue.lock();
+        copiedTasks = std::move(*task_queue_locked);
+        task_queue_locked->clear();
+    }
+
+    for(auto &f : copiedTasks)
+    {
+        try
         {
-            std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-
-            const std::string retainedDBPath = settings.getRetainedMessagesDBFile();
-            if (settings.retainedMessagesMode == RetainedMessagesMode::Enabled)
-                subscriptionStore->saveRetainedMessages(retainedDBPath, in_background);
-            else
-                logger->logf(LOG_INFO, "Not saving '%s', because 'retained_messages_mode' is not 'enabled'.", retainedDBPath.c_str());
-
-            const std::string sessionsDBPath = settings.getSessionsDBFile();
-            subscriptionStore->saveSessionsAndSubscriptions(sessionsDBPath);
-
-            MainApp::saveBridgeInfo(settings.getBridgeNamesDBFile(), bridgeInfos);
-
-            logger->logf(LOG_NOTICE, "Saving states done");
+            f();
+        }
+        catch (std::exception &ex)
+        {
+            Logger::getInstance()->log(LOG_ERR) << "Error in MainApp::performAllImmediateTasks: " << ex.what();
         }
     }
-    catch(std::exception &ex)
-    {
-        logger->logf(LOG_ERR, "Error saving state: %s", ex.what());
-    }
 }
 
-void MainApp::saveBridgeInfo(const std::string &filePath, const std::list<BridgeInfoForSerializing> &bridgeInfos)
+std::shared_ptr<MainApp> MainApp::initMainApp(int argc, char *argv[])
 {
-    Logger *logger = Logger::getInstance();
-    logger->logf(LOG_NOTICE, "Saving bridge info in '%s'", filePath.c_str());
-    BridgeInfoDb bridgeInfoDb(filePath);
-    bridgeInfoDb.openWrite();
-    bridgeInfoDb.saveInfo(bridgeInfos);
-}
-
-std::list<BridgeConfig> MainApp::loadBridgeInfo(Settings &settings)
-{
-    Logger *logger = Logger::getInstance();
-    std::list<BridgeConfig> bridges = settings.stealBridges();
-
-    if (settings.storageDir.empty())
-        return bridges;
-
-    const std::string filePath = settings.getBridgeNamesDBFile();
-
-    try
-    {
-        logger->logf(LOG_NOTICE, "Loading '%s'", filePath.c_str());
-
-        BridgeInfoDb dbfile(filePath);
-        dbfile.openRead();
-        std::list<BridgeInfoForSerializing> bridgeInfos = dbfile.readInfo();
-
-        for(const BridgeInfoForSerializing &info : bridgeInfos)
-        {
-            for(BridgeConfig &bridgeConfig : bridges)
-            {
-                if (!bridgeConfig.useSavedClientId)
-                    continue;
-
-                if (bridgeConfig.clientidPrefix == info.prefix)
-                {
-                    logger->log(LOG_INFO) << "Assigning stored bridge clientid '" << info.clientId << "' to bridge '" << info.prefix << "'.";
-                    bridgeConfig.setClientId(info.prefix, info.clientId);
-                    break;
-                }
-            }
-        }
-    }
-    catch (PersistenceFileCantBeOpened &ex)
-    {
-        logger->logf(LOG_WARNING, "File '%s' is not there (yet)", filePath.c_str());
-    }
-
-    return bridges;
-}
-
-void MainApp::initMainApp(int argc, char *argv[])
-{
-    if (instance != nullptr)
-        throw std::runtime_error("App was already initialized.");
-
     static struct option long_options[] =
     {
         {"help", no_argument, nullptr, 'h'},
@@ -593,20 +556,17 @@ void MainApp::initMainApp(int argc, char *argv[])
         }
     }
 
-    instance = new MainApp(configFile);
-    instance->setFuzzFile(fuzzFile);
+    std::shared_ptr<MainApp> result(new MainApp(configFile));
+    result->setSelf(result);
+    result->setFuzzFile(fuzzFile);
+    return result;
 }
 
-
-MainApp *MainApp::getMainApp()
-{
-    if (!instance)
-        throw std::runtime_error("You haven't initialized the app yet.");
-    return instance;
-}
 
 void MainApp::start()
 {
+    assert(mInitializedByThread == pthread_self());
+
 #ifndef NDEBUG
 #ifndef TESTING
     if (!getFuzzMode())
@@ -657,15 +617,15 @@ void MainApp::start()
 
             std::shared_ptr<PluginLoader> pluginLoader = std::make_shared<PluginLoader>();
 
-            std::shared_ptr<ThreadData> threaddata = std::make_shared<ThreadData>(0, settings, pluginLoader);
+            std::shared_ptr<ThreadData> threaddata = std::make_shared<ThreadData>(0, settings, pluginLoader, mSelf);
             ThreadGlobals::assignThreadData(threaddata);
 
-            std::shared_ptr<Client> client = std::make_shared<Client>(ClientType::Normal, fd, threaddata, FmqSsl(), connectionProtocol, false, nullptr, settings, true);
-            std::shared_ptr<Client> subscriber = std::make_shared<Client>(ClientType::Normal, fdnull, threaddata, FmqSsl(), connectionProtocol, false, nullptr, settings, true);
+            std::shared_ptr<Client> client = std::make_shared<Client>(ClientType::Normal, fd, threaddata, FmqSsl(), connectionProtocol, HaProxyMode::Off, nullptr, settings, true);
+            std::shared_ptr<Client> subscriber = std::make_shared<Client>(ClientType::Normal, fdnull, threaddata, FmqSsl(), connectionProtocol, HaProxyMode::Off, nullptr, settings, true);
             subscriber->setClientProperties(ProtocolVersion::Mqtt311, "subscriber", {}, "subuser", true, 60);
             subscriber->setAuthenticated(true);
 
-            std::shared_ptr<Client> websocketsubscriber = std::make_shared<Client>(ClientType::Normal, fdnull2, threaddata, FmqSsl(), ConnectionProtocol::WebsocketMqtt, false, nullptr, settings, true);
+            std::shared_ptr<Client> websocketsubscriber = std::make_shared<Client>(ClientType::Normal, fdnull2, threaddata, FmqSsl(), ConnectionProtocol::WebsocketMqtt, HaProxyMode::Off, nullptr, settings, true);
             websocketsubscriber->setClientProperties(ProtocolVersion::Mqtt311, "websocketsubscriber", {}, "websocksubuser", true, 60);
             websocketsubscriber->setAuthenticated(true);
             websocketsubscriber->setFakeUpgraded();
@@ -713,7 +673,7 @@ void MainApp::start()
 
     for (int i = 0; i < num_threads; i++)
     {
-        threads.emplace_back(i, settings, pluginLoader);
+        threads.emplace_back(i, settings, pluginLoader, mSelf);
         threads.back().start();
     }
 
@@ -730,24 +690,33 @@ void MainApp::start()
         threads.front()->queuePublishStatsOnDollarTopic(thread_datas);
     }
 
+    this->threadsPendingInit = threads.size();
+
+    {
+        auto locked_global_threads = globals->threadDatas.lock();
+
+        for (auto &t : threads)
+        {
+            locked_global_threads->push_back(t.getThreadData());
+        }
+    }
+
     sendBridgesToThreads();
-    queueBridgeReconnectAllThreads(true);
+    queueBridgeReconnectAllThreads();
 
     std::minstd_rand randomish;
     randomish.seed(get_random_int<unsigned long>());
 
     this->bgWorker.start();
 
-    struct epoll_event events[MAX_EVENTS];
-    memset(&events, 0, sizeof (struct epoll_event)*MAX_EVENTS);
+    std::vector<epoll_event> events(128);
 
-    started = true;
     while (running)
     {
         const uint32_t next_task_delay = timed_tasks.getTimeTillNext();
         const uint32_t epoll_wait_time = std::min<uint32_t>(next_task_delay, 100);
 
-        int num_fds = epoll_wait(this->epollFdAccept, events, MAX_EVENTS, epoll_wait_time);
+        int num_fds = epoll_wait(this->epollFdAccept, events.data(), events.size(), epoll_wait_time);
 
         if (epoll_wait_time == 0)
             timed_tasks.performAll();
@@ -770,9 +739,10 @@ void MainApp::start()
                     if (!listener)
                         continue;
 
-                    std::shared_ptr<ThreadData> thread_data = threads[listener->next_thread_index++ % num_threads].getThreadData();
+                    std::shared_ptr<ThreadData> thread_data = threads[listener->next_thread_index % num_threads].getThreadData();
 
-                    logger->logf(LOG_DEBUG, "Accepting connection on thread %d on %s", thread_data->threadnr, listener->getProtocolName().c_str());
+                    if (logger->wouldLog(LOG_DEBUG))
+                        logger->log(LOG_DEBUG) << "Accepting connection on thread " << thread_data->threadnr << " on " << listener->getProtocolName();
 
                     struct sockaddr_storage addr_mem;
                     std::memset(&addr_mem, 0, sizeof(addr_mem));
@@ -790,9 +760,13 @@ void MainApp::start()
                             const uint32_t delay = (randomish() & 0x0FFF) + 1000;
                             oss << ". Closing after " << delay << " ms.";
 
-                            auto close_f = [fd]()
+                            // Queue managed fd so that on SIGHUP, they all get closed when the timers are cleared. A bit clunky to
+                            // make a shared pointer, but tasks need copyable things.
+                            std::shared_ptr<FdManaged> fd_managed = std::make_shared<FdManaged>(fd);
+
+                            auto close_f = [fd_managed]()
                             {
-                                close(fd);
+                                (void)fd_managed;
                             };
 
                             timed_tasks.addTask(close_f, delay);
@@ -807,6 +781,8 @@ void MainApp::start()
 
                         continue;
                     }
+
+                    listener->next_thread_index++;
 
                     /*
                      * I decided to not use a delayed close mechanism. It has been observed that under overload and clients in a reconnect loop,
@@ -884,7 +860,7 @@ void MainApp::start()
 
                     // Don't use std::make_shared to avoid the weak pointers keeping the control block in memory.
                     std::shared_ptr<Client> client = std::shared_ptr<Client>(new Client(
-                        ClientType::Normal, fd, thread_data, std::move(clientSSL), listener->connectionProtocol, listener->isHaProxy(), addr, settings));
+                        ClientType::Normal, fd, thread_data, std::move(clientSSL), listener->connectionProtocol, listener->haProxyMode, addr, settings));
 
                     if (listener->getX509ClientVerficationMode() != X509ClientVerification::None)
                     {
@@ -928,6 +904,8 @@ void MainApp::start()
                     {
                         memoryTrim();
                     }
+
+                    performAllImmediateTasks();
                 }
             }
             catch (std::exception &ex)
@@ -1004,6 +982,11 @@ void MainApp::start()
 
     std::list<BridgeInfoForSerializing> bridgeInfos = BridgeInfoForSerializing::getBridgeInfosForSerializing(this->bridgeConfigs);
     saveState(this->settings, bridgeInfos, false);
+
+    if (errorExit)
+    {
+        throw std::runtime_error("Exiting with error.");
+    }
 }
 
 void MainApp::queueQuit()
@@ -1023,6 +1006,12 @@ void MainApp::quit()
     Logger *logger = Logger::getInstance();
     logger->logf(LOG_NOTICE, "Quitting FlashMQ");
     running = false;
+}
+
+void MainApp::setSelf(const std::shared_ptr<MainApp> &self)
+{
+    assert(this == self.get());
+    mSelf = self;
 }
 
 bool MainApp::getFuzzMode() const
@@ -1090,7 +1079,7 @@ void MainApp::loadConfig(bool reload)
         for(std::shared_ptr<Listener> &listener : this->listeners)
         {
             listener->loadCertAndKeyFromConfig();
-            std::list<ScopedSocket> scopedSockets = createListenSocket(listener);
+            std::list<ScopedSocket> scopedSockets = createListenSocket(listener, reload);
 
             if (scopedSockets.empty())
             {
@@ -1152,13 +1141,13 @@ void MainApp::loadConfig(bool reload)
         if (reload)
         {
             sendBridgesToThreads();
-            queueBridgeReconnectAllThreads(false);
+            queueBridgeReconnectAllThreads();
         }
     }
 
     logger->setLogPath(settings.logPath);
     logger->queueReOpen();
-    logger->setFlags(settings.logLevel, settings.logSubscriptions);
+    logger->setFlags(settings.logLevel, settings.logSubscriptions, settings.logPublishes);
     logger->setFlags(settings.logDebug, settings.quiet);
 
     setlimits();
@@ -1168,7 +1157,8 @@ void MainApp::loadConfig(bool reload)
         thread->queueReload(settings);
     }
 
-    reloadTimers(reload, oldSettings);
+    if (reload)
+        reloadTimers(&oldSettings);
 }
 
 void MainApp::reloadConfig()
@@ -1196,20 +1186,20 @@ void MainApp::reopenLogfile()
     logger->logf(LOG_NOTICE, "Log files reopened");
 }
 
-void MainApp::reloadTimers(bool reload, const Settings &old_settings)
+void MainApp::reloadTimers(const Settings *old_settings)
 {
     /*
      * Avoid postponing timed events when people continously send sighup signals.
      *
      * TODO: better method, that is not susceptible to forgetting adding settings here when more timers can change.
      */
-    if (reload && settings.pluginTimerPeriod == old_settings.pluginTimerPeriod && settings.saveStateInterval == old_settings.saveStateInterval)
+    if (old_settings && settings.pluginTimerPeriod == old_settings->pluginTimerPeriod && settings.saveStateInterval == old_settings->saveStateInterval)
     {
         logger->log(LOG_NOTICE) << "Timer config not changed. Not re-adding timers.";
         return;
     }
 
-    if (reload)
+    if (old_settings)
         logger->log(LOG_NOTICE) << "Settings impacting timed events changed. Re-adding timers.";
     else
         logger->log(LOG_NOTICE) << "Adding timers";
@@ -1277,6 +1267,15 @@ void MainApp::reloadTimers(bool reload, const Settings &old_settings)
         auto fInternalHeartbeat = std::bind(&MainApp::queueInternalHeartbeat, this);
         timed_tasks.addTask(fInternalHeartbeat, HEARTBEAT_INTERVAL, true);
     }
+
+    {
+        uint32_t interval = 5000;
+#ifdef TESTING
+        interval = 1000;
+#endif
+        auto fReconnectBridges = std::bind(&MainApp::queueBridgeReconnectAllThreads, this);
+        timed_tasks.addTask(fReconnectBridges, interval, true);
+    }
 }
 
 /**
@@ -1340,6 +1339,42 @@ void MainApp::memoryTrim()
         sresult = "Result was 1, so memory was returned to the system.";
 
     logger->log(LOG_NOTICE) << "Operation malloc_trim(0) done. " << sresult << " Duration was " << dur.count() << " µs.";
+}
+
+void MainApp::queueThreadInitDecrement()
+{
+    auto f = [this]() {
+        if (this->threadsPendingInit == 0)
+            return;
+
+        this->threadsPendingInit--;
+
+        if (this->threadsPendingInit != 0)
+            return;
+
+        Logger::getInstance()->log(LOG_NOTICE) << "Threads initialized. Creating listeners and timers.";
+
+        try
+        {
+            for (auto &pair : activeListenSockets)
+            {
+                pair.second.doListen(this->epollFdAccept);
+            }
+
+            reloadTimers(nullptr);
+            started = true;
+
+            notify_ready();
+        }
+        catch (std::exception &ex)
+        {
+            Logger::getInstance()->log(LOG_ERROR) << "Error creating listeners and timers : " << ex.what();
+            errorExit = true;
+            queueQuit();
+        }
+    };
+
+    addImmediateTask(f);
 }
 
 
