@@ -682,7 +682,7 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
         std::array<uint8_t, 8> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -811,7 +811,7 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
             std::array<uint8_t, 8> pcounts;
             pcounts.fill(0);
 
-            while (pos < prop_end_at)
+            while (withinBound(prop_end_at))
             {
                 const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -964,7 +964,7 @@ ConnAckData MqttPacket::parseConnAckData()
         std::array<uint8_t, 16> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -977,29 +977,49 @@ ConnAckData MqttPacket::parseConnAckData()
                 result.session_expire = std::min<uint32_t>(readFourBytesToUint32(), result.session_expire);
                 break;
             case Mqtt5Properties::ReceiveMaximum:
+            {
                 if (pcounts[1]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
 
-                result.client_receive_max = std::min<uint16_t>(readTwoBytesToUInt16(), result.client_receive_max);
+                const uint16_t val{readTwoBytesToUInt16()};
+                if (val == 0)
+                    throw ProtocolError("In CONNACK: ReceiveMax can't be 0", ReasonCodes::ProtocolError);
+                result.client_receive_max = std::min<uint16_t>(val, result.client_receive_max);
                 break;
+            }
             case Mqtt5Properties::MaximumQoS:
+            {
                 if (pcounts[2]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
 
-                result.max_qos = std::min<uint8_t>(readUint8(), result.max_qos);
+                const uint8_t val {readUint8()};
+                if (val > 2)
+                    throw ProtocolError("In CONNACK: QoS must be <= 2", ReasonCodes::ProtocolError);
+                result.max_qos = std::min<uint8_t>(val, result.max_qos);
                 break;
+            }
             case Mqtt5Properties::RetainAvailable:
+            {
                 if (pcounts[3]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
 
-                result.retained_available = static_cast<bool>(readByte());
+                const uint8_t val{readUint8()};
+                if (val > 1)
+                    throw ProtocolError("In CONNACK: RetainAvailable must be <= 1", ReasonCodes::ProtocolError);
+                result.retained_available = static_cast<bool>(val);
                 break;
+            }
             case Mqtt5Properties::MaximumPacketSize:
+            {
                 if (pcounts[4]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
 
-                result.max_outgoing_packet_size = std::min<uint32_t>(readFourBytesToUint32(), result.max_outgoing_packet_size);
+                const uint32_t val {readFourBytesToUint32()};
+                if (val == 0)
+                    throw ProtocolError("In CONNACK: MaximumPacketSize must be > 0", ReasonCodes::ProtocolError);
+                result.max_outgoing_packet_size = std::min<uint32_t>(val, result.max_outgoing_packet_size);
                 break;
+            }
             case Mqtt5Properties::AssignedClientIdentifier:
                 if (pcounts[5]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
@@ -1039,11 +1059,16 @@ ConnAckData MqttPacket::parseConnAckData()
                 readByte();
                 break;
             case Mqtt5Properties::SharedSubscriptionAvailable:
+            {
                 if (pcounts[10]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
 
-                result.shared_subscriptions_available = !!readByte();
+                const uint8_t val{readUint8()};
+                if (val > 1)
+                    throw ProtocolError("In CONNACK: SharedSubscriptionAvailable must be <= 1", ReasonCodes::ProtocolError);
+                result.shared_subscriptions_available = static_cast<bool>(val);
                 break;
+            }
             case Mqtt5Properties::ServerKeepAlive:
                 if (pcounts[11]++ > 0)
                     throw ProtocolError("Can't specify " + propertyToString(prop) + " more than once", ReasonCodes::ProtocolError);
@@ -1322,7 +1347,7 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
     logger->logf(LOG_NOTICE, "Bridge '%s' connection established. Subscribing to topics.", sender->repr().c_str());
 
     std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
-    std::shared_ptr<Session> session = bridgeState->session.lock();
+    std::shared_ptr<Session> session = bridgeState->session->lock();
 
     // Should be impossible.
     if (!session)
@@ -1420,7 +1445,7 @@ AuthPacketData MqttPacket::parseAuthData()
         std::array<uint8_t, 4> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -1533,7 +1558,7 @@ DisconnectData MqttPacket::parseDisconnectData()
             std::array<uint8_t, 4> pcounts;
             pcounts.fill(0);
 
-            while (pos < prop_end_at)
+            while (withinBound(prop_end_at))
             {
                 const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -1637,7 +1662,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
         std::array<uint8_t, 1> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -1831,7 +1856,7 @@ void MqttPacket::handleSubAck(std::shared_ptr<Client> &sender)
     if (!bridgeState)
         return;
 
-    std::shared_ptr<Session> session = bridgeState->session.lock();
+    std::shared_ptr<Session> session = bridgeState->session->lock();
 
     // Should be impossible.
     if (!session)
@@ -1861,7 +1886,7 @@ void MqttPacket::handleUnsubscribe(std::shared_ptr<Client> &sender)
         const size_t proplen = decodeVariableByteIntAtPos();
         const size_t prop_end_at = pos + proplen;
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -1963,7 +1988,7 @@ void MqttPacket::parsePublishData(std::shared_ptr<Client> &sender)
         std::array<uint8_t, 8> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -2267,6 +2292,27 @@ PubRecData MqttPacket::parsePubRecData()
     if (!atEnd())
     {
         result.reasonCode = static_cast<ReasonCodes>(readUint8());
+
+        if (result.reasonCode > ReasonCodes::Success)
+        {
+            switch(result.reasonCode)
+            {
+            case ReasonCodes::Success:
+            case ReasonCodes::NoMatchingSubscribers:
+            case ReasonCodes::UnspecifiedError:
+            case ReasonCodes::ImplementationSpecificError:
+            case ReasonCodes::NotAuthorized:
+            case ReasonCodes::TopicNameInvalid:
+            case ReasonCodes::PacketIdentifierInUse:
+            case ReasonCodes::QuotaExceeded:
+            case ReasonCodes::PayloadFormatInvalid:
+            {
+                break;
+            }
+            default:
+                throw ProtocolError("Invalid reason code in PUBREC", ReasonCodes::ProtocolError);
+            }
+        }
     }
 
     return result;
@@ -2366,7 +2412,7 @@ SubAckData MqttPacket::parseSubAckData()
         std::array<uint8_t, 1> pcounts;
         pcounts.fill(0);
 
-        while (pos < prop_end_at)
+        while (withinBound(prop_end_at))
         {
             const Mqtt5Properties prop = static_cast<Mqtt5Properties>(readUint8());
 
@@ -2418,6 +2464,14 @@ bool MqttPacket::atEnd() const
 {
     assert(pos <= bites.size());
     return pos >= bites.size();
+}
+
+bool MqttPacket::withinBound(const size_t limit) const
+{
+    if (pos > limit)
+        throw ProtocolError("Out of bounds", ReasonCodes::MalformedPacket);
+
+    return pos < limit;
 }
 
 void MqttPacket::setPacketId(uint16_t packet_id)
