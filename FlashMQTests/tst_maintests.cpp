@@ -598,53 +598,51 @@ void MainTests::test_validUtf8Generic()
 #ifndef FMQ_NO_SSE
 void MainTests::test_validUtf8Sse()
 {
-    SimdUtils data;
-
     char m[16];
 
-    QVERIFY(data.isValidUtf8(""));
-    QVERIFY(data.isValidUtf8("ƀ"));
-    QVERIFY(data.isValidUtf8("Hello"));
+    QVERIFY(isValidUtf8Sse(""));
+    QVERIFY(isValidUtf8Sse("ƀ"));
+    QVERIFY(isValidUtf8Sse("Hello"));
 
     std::memset(m, 0, 16);
-    QVERIFY(!data.isValidUtf8(std::string(m, 16)));
+    QVERIFY(!isValidUtf8Sse(std::string(m, 16)));
 
-    QVERIFY(data.isValidUtf8("Straƀe")); // two byte chars
-    QVERIFY(data.isValidUtf8("StraƀeHelloHelloHelloHelloHelloHello")); // two byte chars
-    QVERIFY(data.isValidUtf8("HelloHelloHelloHelloHelloHelloHelloHelloStraƀeHelloHelloHelloHelloHelloHello")); // two byte chars
+    QVERIFY(isValidUtf8Sse("Straƀe")); // two byte chars
+    QVERIFY(isValidUtf8Sse("StraƀeHelloHelloHelloHelloHelloHello")); // two byte chars
+    QVERIFY(isValidUtf8Sse("HelloHelloHelloHelloHelloHelloHelloHelloStraƀeHelloHelloHelloHelloHelloHello")); // two byte chars
 
-    QVERIFY(!data.isValidUtf8("Straƀe#", true));
-    QVERIFY(!data.isValidUtf8("ƀ#", true));
-    QVERIFY(!data.isValidUtf8("#ƀ", true));
-    QVERIFY(!data.isValidUtf8("+", true));
-    QVERIFY(!data.isValidUtf8("🩰+asdfasdfasdf", true));
-    QVERIFY(!data.isValidUtf8("+asdfasdfasdf", true));
+    QVERIFY(!isValidUtf8Sse("Straƀe#", true));
+    QVERIFY(!isValidUtf8Sse("ƀ#", true));
+    QVERIFY(!isValidUtf8Sse("#ƀ", true));
+    QVERIFY(!isValidUtf8Sse("+", true));
+    QVERIFY(!isValidUtf8Sse("🩰+asdfasdfasdf", true));
+    QVERIFY(!isValidUtf8Sse("+asdfasdfasdf", true));
 
     std::memset(m, 0, 16);
     m[0] = 'a';
     m[1] = 13; // is \r
-    QVERIFY(!data.isValidUtf8(std::string(m, 16)));
+    QVERIFY(!isValidUtf8Sse(std::string(m, 16)));
 
     const std::string unicode_ballet_shoes("🩰");
     QVERIFY(unicode_ballet_shoes.length() == 4);
-    QVERIFY(data.isValidUtf8(unicode_ballet_shoes));
+    QVERIFY(isValidUtf8Sse(unicode_ballet_shoes));
 
     const std::string unicode_ballot_box("☐");
     QVERIFY(unicode_ballot_box.length() == 3);
-    QVERIFY(data.isValidUtf8(unicode_ballot_box));
+    QVERIFY(isValidUtf8Sse(unicode_ballot_box));
 
     std::memset(m, 0, 16);
     m[0] = 0b11000001; // Start 2 byte char
     m[1] = 0b00000001; // Next byte doesn't start with 1, which is wrong
     std::string a(m, 2);
-    QVERIFY(!data.isValidUtf8(a));
+    QVERIFY(!isValidUtf8Sse(a));
 
     std::memset(m, 0, 16);
     m[0] = 0b11100001; // Start 3 byte char
     m[1] = 0b10100001;
     m[2] = 0b00000001; // Next byte doesn't start with 1, which is wrong
     std::string b(m, 3);
-    QVERIFY(!data.isValidUtf8(b));
+    QVERIFY(!isValidUtf8Sse(b));
 
     std::memset(m, 0, 16);
     m[0] = 0b11110001; // Start 4 byte char
@@ -652,7 +650,7 @@ void MainTests::test_validUtf8Sse()
     m[2] = 0b10100001;
     m[3] = 0b00000001; // Next byte doesn't start with 1, which is wrong
     std::string c(m, 4);
-    QVERIFY(!data.isValidUtf8(c));
+    QVERIFY(!isValidUtf8Sse(c));
 
     std::memset(m, 0, 16);
     m[0] = 0b11110001; // Start 4 byte char
@@ -660,13 +658,13 @@ void MainTests::test_validUtf8Sse()
     m[2] = 0b00100001; // Doesn't start with 1: invalid.
     m[3] = 0b10000001;
     std::string d(m, 4);
-    QVERIFY(!data.isValidUtf8(d));
+    QVERIFY(!isValidUtf8Sse(d));
 
     // Upper ASCII, invalid
     std::memset(m, 0, 16);
     m[0] = 127;
     std::string e(m, 1);
-    QVERIFY(!data.isValidUtf8(e));
+    QVERIFY(!isValidUtf8Sse(e));
 }
 
 /**
@@ -674,8 +672,6 @@ void MainTests::test_validUtf8Sse()
  */
 void MainTests::test_utf8_nonchars()
 {
-    SimdUtils simd_utils;
-
     for (int i = 0x80; i < 0x90; i++)
     {
         std::string c;
@@ -684,7 +680,7 @@ void MainTests::test_utf8_nonchars()
         c.push_back(i);
 
         QVERIFY(isValidUtf8Generic(c));
-        QVERIFY(simd_utils.isValidUtf8(c));
+        QVERIFY(isValidUtf8Sse(c));
     }
 
     // The invalid ones
@@ -696,7 +692,7 @@ void MainTests::test_utf8_nonchars()
         c.push_back(i);
 
         QVERIFY(!isValidUtf8Generic(c));
-        QVERIFY(!simd_utils.isValidUtf8(c));
+        QVERIFY(!isValidUtf8Sse(c));
     }
 
     for (int i = 0xB0; i < 0xB5; i++)
@@ -707,7 +703,7 @@ void MainTests::test_utf8_nonchars()
         c.push_back(i);
 
         QVERIFY(isValidUtf8Generic(c));
-        QVERIFY(simd_utils.isValidUtf8(c));
+        QVERIFY(isValidUtf8Sse(c));
     }
 
     // Now the last two code points of the multilingual planes
@@ -716,32 +712,32 @@ void MainTests::test_utf8_nonchars()
         std::string s;
         s.clear(); s.push_back(0xEF); s.push_back(0xBF); s.push_back(0xBE);
         QVERIFY(!isValidUtf8Generic(s));
-        QVERIFY(!simd_utils.isValidUtf8(s));
+        QVERIFY(!isValidUtf8Sse(s));
 
         s.clear(); s.push_back(0xEF); s.push_back(0xBF); s.push_back(0xBF);
         QVERIFY(!isValidUtf8Generic(s));
-        QVERIFY(!simd_utils.isValidUtf8(s));
+        QVERIFY(!isValidUtf8Sse(s));
 
         // Adjacent one that is valid.
         s.clear(); s.push_back(0xEF); s.push_back(0xBF); s.push_back(0xBD);
         QVERIFY(isValidUtf8Generic(s));
-        QVERIFY(simd_utils.isValidUtf8(s));
+        QVERIFY(isValidUtf8Sse(s));
     }
 
     {
         std::string s;
         s.clear(); s.push_back(0xF0); s.push_back(0x9F); s.push_back(0xBF); s.push_back(0xBE);
         QVERIFY(!isValidUtf8Generic(s));
-        QVERIFY(!simd_utils.isValidUtf8(s));
+        QVERIFY(!isValidUtf8Sse(s));
 
         s.clear(); s.push_back(0xF0); s.push_back(0x9F); s.push_back(0xBF); s.push_back(0xBF);
         QVERIFY(!isValidUtf8Generic(s));
-        QVERIFY(!simd_utils.isValidUtf8(s));
+        QVERIFY(!isValidUtf8Sse(s));
 
         // Adjacent one that is valid.
         s.clear(); s.push_back(0xF0); s.push_back(0x9F); s.push_back(0xBF); s.push_back(0xBD);
         QVERIFY(isValidUtf8Generic(s));
-        QVERIFY(simd_utils.isValidUtf8(s));
+        QVERIFY(isValidUtf8Sse(s));
     }
 
     // TODO: there are more planes to check, but programming that out means encoding in UTF8.
@@ -756,14 +752,12 @@ void MainTests::test_utf8_nonchars()
  */
 void MainTests::test_utf8_overlong()
 {
-    SimdUtils simd_utils;
-
     {
         std::string two;
         two.push_back(0xc0);
         two.push_back(0xaf);
         QVERIFY(!isValidUtf8Generic(two));
-        QVERIFY(!simd_utils.isValidUtf8(two));
+        QVERIFY(!isValidUtf8Sse(two));
     }
 
     {
@@ -772,7 +766,7 @@ void MainTests::test_utf8_overlong()
         three.push_back(0x80);
         three.push_back(0xaf);
         QVERIFY(!isValidUtf8Generic(three));
-        QVERIFY(!simd_utils.isValidUtf8(three));
+        QVERIFY(!isValidUtf8Sse(three));
     }
 
     {
@@ -782,14 +776,25 @@ void MainTests::test_utf8_overlong()
         four.push_back(0x80);
         four.push_back(0xaf);
         QVERIFY(!isValidUtf8Generic(four));
-        QVERIFY(!simd_utils.isValidUtf8(four));
+        QVERIFY(!isValidUtf8Sse(four));
     }
+}
+
+void MainTests::test_utf8_ascii_range_among_multi_byte()
+{
+    std::string test_me;
+    test_me.push_back(0x14);
+    test_me.push_back(0xd3);
+    test_me.push_back(0xa3);
+
+    const bool b = isValidUtf8Sse(test_me);
+    const bool c = isValidUtf8Generic(test_me);
+
+    QVERIFY(b == c);
 }
 
 void MainTests::test_utf8_compare_implementation()
 {
-    SimdUtils simd_utils;
-
     // Just something to look at. It prefixes lines with a red cross when the checker returns false. Note that this means you
     // don't see the difference between invalid UTF8 and valid but invalid for MQTT.
     FlashMQTempDir tmpdir;
@@ -800,7 +805,7 @@ void MainTests::test_utf8_compare_implementation()
     for(std::string line; getline(infile, line ); )
     {
         const bool a = isValidUtf8Generic(line);
-        const bool b = simd_utils.isValidUtf8(line);
+        const bool b = isValidUtf8Sse(line);
 
         QVERIFY(a == b);
 
@@ -815,6 +820,32 @@ void MainTests::test_utf8_compare_implementation()
     }
 
     QVERIFY(line_count > 40);
+}
+
+void MainTests::test_utf8_compare_implementation2()
+{
+    SimdUtils simd_utils;
+    std::array<char, 128> buf {};
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+
+    while (std::chrono::steady_clock::now() < limit)
+    {
+        const size_t random_length = get_random_int<size_t>() % buf.size();
+        getrandom(buf.data(), random_length, 0);
+        const bool also_check_invalid_publish = static_cast<bool>(get_random_int<int>() % 2);
+        const std::string test_me(buf.data(), random_length);
+
+        const bool b = isValidUtf8Sse(test_me, also_check_invalid_publish);
+        const bool c = isValidUtf8Generic(test_me, also_check_invalid_publish);
+
+        if (b != c && false)
+        {
+            std::ofstream f("/tmp/utf8-test-mismatch.dat", std::ios::binary);
+            f << test_me;
+        }
+
+        QVERIFY(b == c);
+    }
 }
 #endif
 
@@ -1033,7 +1064,7 @@ void MainTests::testSavingSessions()
             QCOMPARE(ses->client_id, ses2->client_id);
             QCOMPARE(qos_locked->incomingQoS2MessageIds, qos_locked2->incomingQoS2MessageIds);
             QCOMPARE(qos_locked->outgoingQoS2MessageIds, qos_locked2->outgoingQoS2MessageIds);
-            QCOMPARE(qos_locked->nextPacketId, qos_locked2->nextPacketId);
+            QCOMPARE(qos_locked->getInternalNextPacketId(), qos_locked2->getInternalNextPacketId());
         }
 
         std::unordered_map<std::string, std::list<SubscriptionForSerializing>> store1Subscriptions;
@@ -1093,7 +1124,10 @@ void MainTests::testSavingSessions()
 
         std::shared_ptr<Session> loadedSes = store2->sessionsById["c1"];
         MutexLocked<Session::QoSData> qos_loaded_locked = loadedSes->qos.lock();
-        std::shared_ptr<QueuedPublish> queuedPublishLoaded = qos_loaded_locked->qosPacketQueue.popNext();
+        std::shared_ptr<QueuedPublish> queuedPublishLoaded = qos_loaded_locked->getQoSQueueTail();
+
+        if (queuedPublishLoaded)
+            qos_loaded_locked->eraseQueuedPublish(queuedPublishLoaded->getPacketId());
 
         QCOMPARE(queuedPublishLoaded->getPublish().topic, "a/b/c");
         QCOMPARE(queuedPublishLoaded->getPublish().payload, "Hello Barry");

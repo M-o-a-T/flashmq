@@ -25,7 +25,7 @@ See LICENSE for license details.
 #include <random>
 #include <atomic>
 
-#include "client.h"
+#include "forward_declarations.h"
 #include "plugin.h"
 #include "logger.h"
 #include "derivablecounter.h"
@@ -38,6 +38,8 @@ See LICENSE for license details.
 #include "clientacceptqueue.h"
 
 class MainApp;
+
+void logStringStreamQueuedHelper(std::ostringstream &oss, Client *client);
 
 struct KeepAliveCheck
 {
@@ -64,7 +66,9 @@ struct Clients
 
 struct ThreadDataOwner
 {
+    const int threadnr = -1;
     std::shared_ptr<ThreadData> td;
+    std::weak_ptr<ThreadData> td_weak;
     std::thread thread;
 
     ThreadDataOwner() = delete;
@@ -78,29 +82,69 @@ struct ThreadDataOwner
 
     void start();
     void waitForQuit();
-    ThreadData *operator->() const;
     std::shared_ptr<ThreadData> getThreadData() const;
+    bool running() const;
+    bool finished() const;
+    bool notAllWillQueuedButStillRunning() const;
+    std::chrono::milliseconds getDrift() const;
+
+    template<typename F, typename... Args>
+    void callIfThread(F&& f, Args&&... args)
+    {
+        auto t = td_weak.lock();
+        if (!t)
+            return;
+
+        return std::invoke(
+            std::forward<F>(f),
+            *t,
+            std::forward<Args>(args)...);
+    }
+
+    void setThreadPrefix(const std::string prefix);
+
 };
 
 class ThreadData
 {
+public:
+
+    /**
+     * @brief Allows for single-shot future-proof deletion of all we own, including any shared pointers that we
+     * want to clear up at the end of this thread, before our destructor runs.
+     */
+    struct PrivateData
+    {
+        Clients clients;
+        std::forward_list<std::weak_ptr<Client>> clientsQueuedForRemoving;
+        std::map<std::chrono::seconds, std::vector<KeepAliveCheck>> queuedKeepAliveChecks;
+        std::list<QueuedRetainedMessage> queuedRetainedMessages;
+    };
+
+    /**
+     * @brief Same note as PrivateData.
+     */
+    struct PublicData
+    {
+        MutexOwned<std::list<std::function<void()>>> taskQueue;
+        QueuedTasks delayedTasks;
+        std::unordered_map<int, std::weak_ptr<void>> externalFds;
+        std::vector<std::weak_ptr<Client>> disconnectingClients;
+        ClientAcceptQueue acceptQueue;
+    };
+
+private:
     FdManaged epollfd;
-    Clients clients;
+    std::optional<PrivateData> priv = std::make_optional<PrivateData>();
     Logger *logger;
-
-    std::forward_list<std::weak_ptr<Client>> clientsQueuedForRemoving;
-    std::map<std::chrono::seconds, std::vector<KeepAliveCheck>> queuedKeepAliveChecks;
-
-    std::list<QueuedRetainedMessage> queuedRetainedMessages;
-
     const std::shared_ptr<const PluginLoader> pluginLoader;
+    std::string threadPrefix;
 
     void reload(const Settings &settings);
     void wakeUpThread();
     void doKeepAliveCheck();
     void quit();
     void publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadData>> &threads);
-    void publishStat(const std::string &topic, int64_t n);
     void sendQueuedWills();
     void removeExpiredSessions();
     void purgeSubscriptionTree();
@@ -114,10 +158,11 @@ class ThreadData
     void bridgeReconnect();
 
     void removeQueuedClients();
-    void publishWithAcl(Publish &pub, bool setRetain=false);
+    void publishStatWithAcl(Publish &pub, bool setRetain=false);
     void removeBridge(const BridgeConfig &bridgeConfig, const std::string &reason);
 
 public:
+    std::optional<PublicData> pub = std::make_optional<PublicData>();
     Settings settingsLocalCopy; // Is updated on reload, within the thread loop.
     Authentication authentication;
     bool deferThreadReady = false;
@@ -129,12 +174,7 @@ public:
     int taskEventFd = -1;
     int disconnectingAllEventFd = -1;
     std::atomic<size_t> clientCount{0};
-    MutexOwned<std::list<std::function<void()>>> taskQueue;
-    QueuedTasks delayedTasks;
     DriftCounter driftCounter;
-    std::unordered_map<int, std::weak_ptr<void>> externalFds;
-    std::vector<std::weak_ptr<Client>> disconnectingClients;
-    ClientAcceptQueue acceptQueue;
     std::weak_ptr<MainApp> mMainApp;
 
     DerivableCounter receivedMessageCounter;
@@ -155,6 +195,8 @@ public:
     ThreadData(ThreadData &&other) = delete;
     ~ThreadData();
 
+    void setName();
+    void setThreadPrefix(const std::string &prefix);
     int getEpollFd() const { return epollfd.get(); }
 
     void giveClient(std::shared_ptr<Client> &&client);
@@ -162,7 +204,7 @@ public:
     void removeBridgeQueued(const BridgeConfig &bridgeConfig, const std::string &reason);
     std::shared_ptr<Client> getClient(int fd);
     void removeClientQueued(const std::shared_ptr<Client> &client);
-    void removeClientQueued(int fd);
+    void removeClientQueued(int fd, const Client *client, const std::string &reason);
     void removeClient(std::shared_ptr<Client> client);
     void serverInitiatedDisconnect(std::shared_ptr<Client> &&client, ReasonCodes reason, const std::string &reason_text);
     void serverInitiatedDisconnect(const std::shared_ptr<Client> &client, ReasonCodes reason, const std::string &reason_text);
@@ -194,6 +236,7 @@ public:
     void acceptPendingClients();
     void acceptPendingBridges();
     void deleteClients();
+    void clear();
 
     size_t getNrOfClients();
     void updateNrOfClients();
@@ -212,6 +255,41 @@ public:
 
     void addImmediateTask(std::function<void()> f);
     void performAllImmediateTasks();
+
+    template<typename... Args>
+    void logStringQueued(int fd, const Client *client, int level, Args... args)
+    {
+        auto f = [this, fd, client, level, args...] {
+            std::shared_ptr<Client> clientFound;
+
+            auto client_it = priv->clients.by_fd.find(fd);
+            if (client_it != priv->clients.by_fd.end())
+                clientFound = client_it->second;
+
+            // Raw client pointer only for checking; don't dereference.
+            if (!clientFound || clientFound.get() != client)
+                return;
+
+            std::ostringstream oss;
+
+            auto handle = [&](auto arg)
+            {
+                if constexpr (std::is_placeholder_v<decltype(arg)> > 0)
+                    logStringStreamQueuedHelper(oss, clientFound.get());
+                else
+                    oss << arg;
+            };
+
+            (handle(args), ...);
+
+            Logger::getInstance()->log(level) << oss.str();
+        };
+
+        addImmediateTask(f);
+    }
+
+    void publishStat(const std::string &topic, int64_t n);
+    void publishStat(const std::string &topic, const std::string &payload);
 };
 
 

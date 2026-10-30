@@ -54,7 +54,6 @@ Authentication::Authentication(Settings &settings) :
     }
 
     EVP_DigestInit_ex(mosquittoDigestContext.get(), sha512, NULL);
-    memset(&mosquittoPasswordFileLastLoad, 0, sizeof(struct timespec));
 }
 
 void *Authentication::loadSymbol(void *handle, const char *symbol, bool exceptionOnError) const
@@ -313,8 +312,11 @@ void Authentication::onUnsubscribe(
  * Internal publishes write (publish) access is always allowed (it makes little sense that a plugin would have to explicitly allow
  * those), but they are passed through the plugin, so you can inspect them. The read access can still be rejected by a plugin.
  */
-AuthResult Authentication::aclCheck(Publish &publishData, std::string_view payload, AclAccess access)
+AuthResult Authentication::aclWriteCheck(Publish &publishData, std::string_view payload, AclAccess access)
 {
+    assert(access != AclAccess::read);
+    assert(access != AclAccess::subscribe); // (Also) because this requires a potential sharename, and we don't have one available.
+
     AuthResult result = aclCheck(
         publishData.client_id, publishData.username, publishData.topic, publishData.getSubtopics(), "", payload, access, publishData.qos,
         publishData.retain, publishData.correlationData, publishData.responseTopic, publishData.contentType, publishData.expiresAt(),
@@ -708,8 +710,7 @@ void Authentication::loadMosquittoPasswordFile()
         return;
     }
 
-    struct stat statbuf;
-    memset(&statbuf, 0, sizeof(struct stat));
+    struct stat statbuf {};
     check<std::runtime_error>(stat(mosquittoPasswordFile.c_str(), &statbuf));
     struct timespec ctime = statbuf.st_ctim;
 
@@ -810,8 +811,7 @@ void Authentication::loadMosquittoAclFile()
         return;
     }
 
-    struct stat statbuf;
-    memset(&statbuf, 0, sizeof(struct stat));
+    struct stat statbuf {};
     check<std::runtime_error>(stat(mosquittoAclFile.c_str(), &statbuf));
     struct timespec ctime = statbuf.st_ctim;
 

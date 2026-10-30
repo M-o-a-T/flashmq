@@ -93,7 +93,9 @@ class MainTests
     void test_validUtf8Sse();
     void test_utf8_nonchars();
     void test_utf8_overlong();
+    void test_utf8_ascii_range_among_multi_byte();
     void test_utf8_compare_implementation();
+    void test_utf8_compare_implementation2();
 #endif
 
     void testPacketInt16Parse();
@@ -244,6 +246,13 @@ class MainTests
 
     void forkingTestSaveAndLoadDelayedWill();
 
+    void testUsedIds();
+    void testUsedIds2();
+    void testUsedIds3();
+    void testUsedIds4();
+    void testUsedIdsRandomDraining();
+    void testUsedIdsSpeed();
+    void test_contains_value_greater_than();
     void testBase64();
     void testNoCopy();
     void testSessionTakeoverOtherUsername();

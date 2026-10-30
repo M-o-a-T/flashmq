@@ -43,10 +43,58 @@ AsyncAuthResult::AsyncAuthResult(AuthResult result, const std::string authMethod
 
 }
 
-Client::WriteBuf::WriteBuf(size_t size) :
-    buf(size)
+Client::WriteBuf::WriteBuf(size_t size, uint32_t maxOutgoingPacketSize) :
+    buf(size),
+    maxOutgoingPacketSize(maxOutgoingPacketSize)
 {
 
+}
+
+void Client::WriteBuf::checkPressure(Client *client)
+{
+    const size_t limit = getMaxBufSize();
+    checkPressure(limit, client);
+}
+
+void Client::WriteBuf::checkPressure(const size_t limit, Client *client)
+{
+    if (buf.getCapacity() > std::min<size_t>(limit * 100, 1073741824))
+    {
+        if (!pressuredAt)
+        {
+            client->logFormatStringQueued(LOG_WARNING,
+                "Client '", std::placeholders::_1, "' write buffer size of ", buf.getCapacity(), " is more than 100 times allowed buffer size of ",
+                limit, ". If this persists, client will be disconnected.");
+            pressuredAt = std::chrono::steady_clock::now();
+        }
+        else if (pressuredAt.value() + std::chrono::minutes(3) < std::chrono::steady_clock::now())
+        {
+            const std::string err("Client exceeding 100 times max buf size of " + std::to_string(limit) + " for more than 3 minutes.");
+            throw BadClientException(err);
+        }
+    }
+    else
+    {
+        pressuredAt.reset();
+    }
+}
+
+void Client::WriteBuf::forceResetUnderPressureWhenEmpty()
+{
+    if (!pressuredAt)
+        return;
+
+    if (buf.usedBytes() > 0)
+        return;
+
+    buf.resetCapacity(ThreadGlobals::getSettings()->clientInitialBufferSize);
+    pressuredAt.reset();
+}
+
+uint32_t Client::WriteBuf::getMaxBufSize() const
+{
+    const Settings *settings = ThreadGlobals::getSettings();
+    return maxBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
 }
 
 /**
@@ -65,14 +113,13 @@ Client::Client(
         HaProxyMode haProxyMode, const struct sockaddr *addr, const Settings &settings, bool fuzzMode) :
     fd(fd),
     fuzzMode(fuzzMode),
-    maxOutgoingPacketSize(settings.maxPacketSize),
     maxIncomingPacketSize(settings.maxPacketSize),
     maxQos(settings.maxQos),
     mqtt3QoSExceedAction(settings.mqtt3QoSExceedAction),
     maxIncomingTopicAliasValue(settings.maxIncomingTopicAliasValue), // Retaining snapshot of current setting, to not confuse clients when the setting changes.
     ioWrapper(std::move(ssl), connectionProtocol, settings.clientInitialBufferSize, this),
     readbuf(settings.clientInitialBufferSize),
-    writebuf(settings.clientInitialBufferSize),
+    writebuf(settings.clientInitialBufferSize, settings.maxPacketSize),
     clientType(type),
     mHaProxyMode(haProxyMode),
     threadData(threadData),
@@ -240,7 +287,10 @@ void Client::connectToBridgeTarget(FMQSockaddr addr)
 
 void Client::setMaxBufSizeOverride(uint32_t val)
 {
-    this->maxBufSizeOverride = val;
+    this->maxReadBufSizeOverride = val;
+
+    auto locked = writebuf.lock();
+    locked->maxBufSizeOverride = val;
 }
 
 void Client::startOrContinueSslHandshake()
@@ -292,7 +342,7 @@ DisconnectStage Client::readFdIntoBuffer()
         {
             const Settings *settings = ThreadGlobals::getSettings();
             // I guess I should have just made a 'max buffer size' option, and not distinguish between read/write?
-            const uint32_t maxBufSize = this->maxBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
+            const uint32_t maxBufSize = this->maxReadBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
             const uint32_t maxBufOrBigPacketSize= std::max<uint32_t>(this->maxIncomingPacketSize, maxBufSize);
 
             // We always grow for another iteration when there are still decoded websocket/SSL bytes, because epoll doesn't tell us that buffer has data.
@@ -321,6 +371,7 @@ void Client::writeText(const std::string &text)
     assert(ioWrapper.getWebsocketState() == WebsocketState::NotUpgraded);
 
     auto write_buf_locked = writebuf.lock();
+    write_buf_locked->checkPressure(this);
     write_buf_locked->buf.writerange(text.begin(), text.end());
     setReadyForWriting(true, write_buf_locked);
 }
@@ -328,38 +379,43 @@ void Client::writeText(const std::string &text)
 void Client::writePing()
 {
     auto write_buf_locked = writebuf.lock();
+    write_buf_locked->checkPressure(this);
     write_buf_locked->buf.write(0b11000000, 0);
     setReadyForWriting(true, write_buf_locked);
 }
 
 PacketDropReason Client::writeMqttPacket(const MqttPacket &packet)
 {
+    // Warning: this method is called from all threads.
+
+    assert(packet.packetType != PacketType::Reserved);
+
     const size_t packetSize = packet.getSizeIncludingNonPresentHeader();
+
+    auto write_buf_locked = writebuf.lock();
 
     // "Where a Packet is too large to send, the Server MUST discard it without sending it and then behave as if it had completed
     // sending that Application Message [MQTT-3.1.2-25]."
-    if (packetSize > this->maxOutgoingPacketSize)
+    if (packetSize > write_buf_locked->maxOutgoingPacketSize)
     {
         return PacketDropReason::BiggerThanPacketLimit;
     }
 
-    const Settings *settings = ThreadGlobals::getSettings();
-
     // After introducing the client_max_write_buffer_size with low default, this makes it somewhat backwards compatible with the default big packet size.
-    const uint32_t maxBufSize = this->maxBufSizeOverride.value_or(settings->clientMaxWriteBufferSize);
+    const uint32_t maxBufSize { write_buf_locked->getMaxBufSize() };
     const uint32_t growBufMaxTo = std::max<uint32_t>(maxBufSize, packetSize * 2);
-
-    auto write_buf_locked = writebuf.lock();
 
     // Grow as far as we can. We have to make room for one MQTT packet.
     write_buf_locked->buf.ensureFreeSpace(packetSize, growBufMaxTo);
 
-    // And drop a publish when it doesn't fit, even after resizing. This means we do allow pings. And
+    // And drop a publish when it doesn't fit, even after resizing. This means we do allow pings and acks. And
     // QoS packet are queued and limited elsewhere.
     if (packet.packetType == PacketType::PUBLISH && packet.getQos() == 0 && packetSize > write_buf_locked->buf.freeSpace())
     {
         return PacketDropReason::BufferFull;
     }
+
+    write_buf_locked->checkPressure(maxBufSize, this);
 
     packet.readIntoBuf(write_buf_locked->buf);
 
@@ -379,6 +435,8 @@ PacketDropReason Client::writeMqttPacketAndBlameThisClient(
     PublishCopyFactory &copyFactory, uint8_t max_qos, uint16_t packet_id, bool retain, uint32_t subscriptionIdentifier,
     const std::optional<std::string> &topic_override)
 {
+    assert(max_qos == 0 || packet_id > 0);
+
     uint16_t topic_alias = 0;
     uint16_t topic_alias_next = 0;
     bool skip_topic = false;
@@ -455,7 +513,10 @@ PacketDropReason Client::writeMqttPacketAndBlameThisClient(const MqttPacket &pac
     {
         std::shared_ptr<ThreadData> td = this->threadData.lock();
         if (td)
-            td->removeClientQueued(fd.get());
+        {
+            const std::string err(ex.what());
+            td->removeClientQueued(fd.get(), this, err);
+        }
 
         return PacketDropReason::ClientError;
     }
@@ -465,6 +526,7 @@ PacketDropReason Client::writeMqttPacketAndBlameThisClient(const MqttPacket &pac
 void Client::writePingResp()
 {
     auto write_buf_locked = writebuf.lock();
+    write_buf_locked->checkPressure(this);
     write_buf_locked->buf.write(0b11010000, 0);
     setReadyForWriting(true, write_buf_locked);
 }
@@ -485,6 +547,7 @@ void Client::writeLoginPacket()
     connectInfo.maxIncomingTopicAliasValue = config->c.maxIncomingTopicAliases;
     connectInfo.bridgeProtocolBit = config->c.bridgeProtocolBit;
     connectInfo.fmq_client_group_id = config->c.getFmqClientGroupId();
+    connectInfo.clientid_prefix = config->c.clientidPrefix;
 
     MqttPacket pack(connectInfo);
     writeMqttPacket(pack);
@@ -514,6 +577,8 @@ void Client::writeBufIntoFd()
         if (error == IoWrapResult::Wouldblock)
             break;
     }
+
+    write_buf_locked->forceResetUnderPressureWhenEmpty();
 
     const bool data_pending = write_buf_locked->buf.usedBytes() > 0 || ioWrapper.hasPendingWrite() || error == IoWrapResult::Wouldblock;
 
@@ -558,7 +623,7 @@ std::string Client::repr()
     if (this->fmq_client_group_id)
     {
         fmq_client_group_id_part.append("fmq_client_group_id='");
-        fmq_client_group_id_part.append(this->fmq_client_group_id.value());
+        fmq_client_group_id_part.append(redact_right(this->fmq_client_group_id.value()));
         fmq_client_group_id_part.append("', ");
     }
 
@@ -671,8 +736,7 @@ void Client::sendOrQueueWill()
     if (!this->willPublish)
         return;
 
-    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
-    store->queueOrSendWillMessage(willPublish, session);
+    globals->subscriptionStore.queueOrSendWillMessage(willPublish, session);
     this->willPublish.reset();
 }
 
@@ -775,6 +839,7 @@ void Client::setBridgeState(std::shared_ptr<BridgeState> bridgeState)
         this->clean_start = bridgeState->c.localCleanStart;
         this->clientid = bridgeState->c.getClientid();
         this->fmq_client_group_id = bridgeState->c.getFmqClientGroupId();
+        this->client_id_prefix = bridgeState->c.clientidPrefix;
         this->username = bridgeState->c.local_username.value_or(std::string());
         this->keepalive = bridgeState->c.keepalive;
         this->addr.setAddressName(bridgeState->c.address);
@@ -887,8 +952,7 @@ void Client::setReadyForWriting(bool val, MutexLocked<WriteBuf> &writebuf)
 
     writebuf->readyForWriting = val;
 
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof (struct epoll_event));
+    struct epoll_event ev {};
     ev.data.fd = fd.get();
     ev.events = readyForReading*EPOLLIN | val*EPOLLOUT;
     check<std::runtime_error>(epoll_ctl(this->epoll_fd, EPOLL_CTL_MOD, fd.get(), &ev));
@@ -915,8 +979,7 @@ void Client::setReadyForReading(bool val)
 
     readyForReading = val;
 
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof (struct epoll_event));
+    struct epoll_event ev {};
     ev.data.fd = fd.get();
 
     {
@@ -1010,8 +1073,12 @@ void Client::setClientProperties(
     this->username = username;
     this->connectPacketSeen = connectPacketSeen;
     this->keepalive = keepalive;
-    this->maxOutgoingPacketSize = maxOutgoingPacketSize;
     this->maxOutgoingTopicAliasValue = maxOutgoingTopicAliasValue;
+
+    {
+        auto write_buf_locked = writebuf.lock();
+        write_buf_locked->maxOutgoingPacketSize = maxOutgoingPacketSize;
+    }
 }
 
 void Client::setClientProperties(bool connectPacketSeen, uint16_t keepalive, uint32_t maxOutgoingPacketSize, uint16_t maxOutgoingTopicAliasValue, bool supportsRetained)
@@ -1024,9 +1091,23 @@ void Client::setClientProperties(bool connectPacketSeen, uint16_t keepalive, uin
 
     this->connectPacketSeen = connectPacketSeen;
     this->keepalive = keepalive;
-    this->maxOutgoingPacketSize = maxOutgoingPacketSize;
     this->maxOutgoingTopicAliasValue = maxOutgoingTopicAliasValue;
     this->supportsRetained = supportsRetained;
+
+    {
+        auto write_buf_locked = writebuf.lock();
+        write_buf_locked->maxOutgoingPacketSize = maxOutgoingPacketSize;
+    }
+}
+
+void Client::setClientIdPrefix(const std::optional<std::string> &p)
+{
+    assert(!this->client_id_prefix);
+
+    if (p && (p.value().empty() || !startsWith(this->clientid, p.value())))
+        throw ProtocolError("Client ID prefix must a substring of client ID", ReasonCodes::ImplementationSpecificError);
+
+    this->client_id_prefix = p;
 }
 
 void Client::stageWill(WillPublish &&willPublish)
@@ -1140,6 +1221,11 @@ void Client::clearWill()
 
     if (session)
         session->clearWill();
+}
+
+std::string Client::getClientIdOrPrefix() const
+{
+    return client_id_prefix.value_or(clientid);
 }
 
 void Client::setClientId(const std::string &id)

@@ -38,7 +38,6 @@ See LICENSE for license details.
 MainApp::MainApp(const std::string &configFilePath)
 {
     globals = Globals();
-    subscriptionStore = globals->subscriptionStore;
 
     epollFdAccept = check<std::runtime_error>(epoll_create(999));
     taskEventFd = eventfd(0, EFD_NONBLOCK);
@@ -70,11 +69,11 @@ MainApp::MainApp(const std::string &configFilePath)
 
         const std::string retainedDbPath = settings.getRetainedMessagesDBFile();
         if (settings.retainedMessagesMode == RetainedMessagesMode::Enabled)
-            subscriptionStore->loadRetainedMessages(settings.getRetainedMessagesDBFile());
+            globals->subscriptionStore.loadRetainedMessages(settings.getRetainedMessagesDBFile());
         else
             logger->logf(LOG_INFO, "Not loading '%s', because 'retained_messages_mode' is not 'enabled'.", retainedDbPath.c_str());
 
-        subscriptionStore->loadSessionsAndSubscriptions(settings.getSessionsDBFile());
+        globals->subscriptionStore.loadSessionsAndSubscriptions(settings.getSessionsDBFile());
     }
 }
 
@@ -267,7 +266,7 @@ void MainApp::queueKeepAliveCheckAtAllThreads()
 {
     for (ThreadDataOwner &thread : threads)
     {
-        thread->queueDoKeepAliveCheck();
+        thread.callIfThread(&ThreadData::queueDoKeepAliveCheck);
     }
 }
 
@@ -275,7 +274,7 @@ void MainApp::queuePasswordFileReloadAllThreads()
 {
     for (ThreadDataOwner &thread : threads)
     {
-        thread->queuePasswdFileReload();
+        thread.callIfThread(&ThreadData::queuePasswdFileReload);
     }
 }
 
@@ -283,7 +282,7 @@ void MainApp::queuepluginPeriodicEventAllThreads()
 {
     for (ThreadDataOwner &thread : threads)
     {
-        thread->queuepluginPeriodicEvent();
+        thread.callIfThread(&ThreadData::queuepluginPeriodicEvent);
     }
 }
 
@@ -306,7 +305,7 @@ void MainApp::queuePublishStatsOnDollarTopic()
             thread_datas.push_back(t.getThreadData());
         }
 
-        threads.at(0)->queuePublishStatsOnDollarTopic(thread_datas);
+        threads.at(0).callIfThread(&ThreadData::queuePublishStatsOnDollarTopic, thread_datas);
     }
 }
 
@@ -326,8 +325,7 @@ void MainApp::queueSendQueuedWills()
     if (!threads.empty())
     {
         int threadnr = rand() % threads.size();
-        std::shared_ptr<ThreadData> t = threads[threadnr].getThreadData();
-        t->queueSendingQueuedWills();
+        threads[threadnr].callIfThread(&ThreadData::queueSendingQueuedWills);
     }
 }
 
@@ -335,7 +333,7 @@ void MainApp::waitForWillsQueued()
 {
     int i = 0;
 
-    while(std::any_of(threads.begin(), threads.end(), [](const ThreadDataOwner &t){ return !t->allWillsQueued && t->running; }) && i++ < 5000)
+    while(std::any_of(threads.begin(), threads.end(), [](const ThreadDataOwner &t){ return t.notAllWillQueuedButStillRunning(); }) && i++ < 5000)
     {
         usleep(1000);
     }
@@ -346,8 +344,7 @@ void MainApp::queueRetainedMessageExpiration()
     if (!threads.empty())
     {
         int threadnr = rand() % threads.size();
-        std::shared_ptr<ThreadData> t = threads[threadnr].getThreadData();
-        t->queueRemoveExpiredRetainedMessages();
+        threads[threadnr].callIfThread(&ThreadData::queueRemoveExpiredRetainedMessages);
     }
 }
 
@@ -401,7 +398,7 @@ void MainApp::queueBridgeReconnectAllThreads()
     {
         for (ThreadDataOwner &thread : threads)
         {
-            thread->queueBridgeReconnect();
+            thread.callIfThread(&ThreadData::queueBridgeReconnect);
         }
     }
     catch (std::exception &ex)
@@ -433,7 +430,7 @@ void MainApp::queueInternalHeartbeat()
     std::vector<std::chrono::milliseconds> drifts(threads.size());
 
     std::transform(threads.begin(), threads.end(), drifts.begin(), [] (const ThreadDataOwner &t) {
-        return t->driftCounter.getDrift();
+        return t.getDrift();
     });
 
     const size_t n = drifts.size() / 2;
@@ -442,7 +439,7 @@ void MainApp::queueInternalHeartbeat()
 
     for (ThreadDataOwner &thread : threads)
     {
-        thread->queueInternalHeartbeat();
+        thread.callIfThread(&ThreadData::queueInternalHeartbeat);
     }
 }
 
@@ -580,8 +577,7 @@ void MainApp::start()
     logger->noLongerLogToStd();
 #endif
 
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof (struct epoll_event));
+    struct epoll_event ev {};
     ev.data.fd = taskEventFd;
     ev.events = EPOLLIN;
     check<std::runtime_error>(epoll_ctl(this->epollFdAccept, EPOLL_CTL_ADD, taskEventFd, &ev));
@@ -629,12 +625,12 @@ void MainApp::start()
             websocketsubscriber->setClientProperties(ProtocolVersion::Mqtt311, "websocketsubscriber", {}, "websocksubuser", true, 60);
             websocketsubscriber->setAuthenticated(true);
             websocketsubscriber->setFakeUpgraded();
-            subscriptionStore->registerClientAndKickExistingOne(websocketsubscriber);
+            globals->subscriptionStore.registerClientAndKickExistingOne(websocketsubscriber);
             subtopics = splitTopic("#");
-            subscriptionStore->addSubscription(websocketsubscriber->getSession(), subtopics, 0, false, false, empty, 0);
+            globals->subscriptionStore.addSubscription(websocketsubscriber->getSession(), subtopics, 0, false, false, empty, 0);
 
-            subscriptionStore->registerClientAndKickExistingOne(subscriber);
-            subscriptionStore->addSubscription(subscriber->getSession(), subtopics, 0, false, false, empty, 0);
+            globals->subscriptionStore.registerClientAndKickExistingOne(subscriber);
+            globals->subscriptionStore.addSubscription(subscriber->getSession(), subtopics, 0, false, false, empty, 0);
 
             if (connectionProtocol == ConnectionProtocol::WebsocketMqtt && strContains(fuzzFilePathLower, "upgrade"))
             {
@@ -687,7 +683,7 @@ void MainApp::start()
             thread_datas.push_back(t.getThreadData());
         }
 
-        threads.front()->queuePublishStatsOnDollarTopic(thread_datas);
+        threads.front().callIfThread(&ThreadData::queuePublishStatsOnDollarTopic, thread_datas);
     }
 
     this->threadsPendingInit = threads.size();
@@ -744,8 +740,7 @@ void MainApp::start()
                     if (logger->wouldLog(LOG_DEBUG))
                         logger->log(LOG_DEBUG) << "Accepting connection on thread " << thread_data->threadnr << " on " << listener->getProtocolName();
 
-                    struct sockaddr_storage addr_mem;
-                    std::memset(&addr_mem, 0, sizeof(addr_mem));
+                    struct sockaddr_storage addr_mem {};
                     struct sockaddr *addr = reinterpret_cast<sockaddr*>(&addr_mem);
                     socklen_t len = sizeof(addr_mem);
                     int fd = check<std::runtime_error>(accept(cur_fd, addr, &len));
@@ -925,7 +920,7 @@ void MainApp::start()
         logger->logf(LOG_DEBUG, "Having all client in all threads send or queue their will.");
         for(ThreadDataOwner &thread : threads)
         {
-            thread->queueSendWills();
+            thread.callIfThread(&ThreadData::queueSendWills);
         }
         waitForWillsQueued();
     }
@@ -933,44 +928,54 @@ void MainApp::start()
     logger->logf(LOG_DEBUG, "Having all client in all threads send a disconnect packet and initiate quit.");
     for(ThreadDataOwner &thread : threads)
     {
-        thread->queueSendDisconnects();
+        thread.callIfThread(&ThreadData::queueSendDisconnects);
     }
 
     oneInstanceLock.unlock();
 
+    bool waitTimeExpired = false;
+
     {
         logger->logf(LOG_DEBUG, "Waiting for our own quit event to have been queued.");
-        int count = 0;
-        while(std::any_of(threads.begin(), threads.end(), [](const ThreadDataOwner &t){ return t->running; }))
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while(std::any_of(threads.begin(), threads.end(), [](const ThreadDataOwner &t){ return t.running(); }))
         {
-            if (count++ >= 30000)
+            if (limit < std::chrono::steady_clock::now())
+            {
+                logger->log(LOG_WARNING)
+                    << "(Some) threads did not have the quit event queued. Waiting for plugin cleanup will be skipped "
+                    << "because it will not have been initiated. This means an unclean program exit.";
+                waitTimeExpired = true;
                 break;
-            usleep(1000);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(2000));
         }
     }
 
-    logger->logf(LOG_DEBUG, "Waiting for threads clean-up functions to finish.");
-    int count = 0;
-    bool waitTimeExpired = false;
-    while(std::any_of(threads.begin(), threads.end(), [](ThreadDataOwner &t){ return !t->finished; }))
+    if (!waitTimeExpired)
     {
-        if (count++ >= 30000)
+        logger->logf(LOG_DEBUG, "Waiting for threads clean-up functions to finish.");
+
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while(std::any_of(threads.begin(), threads.end(), [](ThreadDataOwner &t){ return !t.finished(); }))
         {
-            waitTimeExpired = true;
-            break;
+            if (limit < std::chrono::steady_clock::now())
+            {
+                logger->log(LOG_WARNING)
+                    << "(Some) threads failed to terminate. Program will exit uncleanly. If you're "
+                    << "using a plugin, it may not be thread-safe.";
+                waitTimeExpired = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(2000));
         }
-        usleep(1000);
     }
 
-    if (waitTimeExpired)
-    {
-        logger->logf(LOG_WARNING, "(Some) threads failed to terminate. Program will exit uncleanly. If you're using a plugin, it may not be thread-safe.");
-    }
-    else
+    if (!waitTimeExpired)
     {
         for(ThreadDataOwner &thread : threads)
         {
-            logger->logf(LOG_DEBUG, "Waiting for thread %d to join.", thread->threadnr);
+            logger->log(LOG_DEBUG) << "Waiting for thread " << thread.threadnr << " to join.";
             thread.waitForQuit();
         }
     }
@@ -1025,13 +1030,23 @@ bool MainApp::getFuzzMode() const
 
 void MainApp::setlimits()
 {
-    rlim_t nofile = settings.rlimitNoFile;
-    logger->log(LOG_INFO) << "Setting rlimit nofile to " << nofile;
-    struct rlimit v = { nofile, nofile };
+    rlimit current {};
+    if (getrlimit(RLIMIT_NOFILE, &current) != 0)
+    {
+        logger->log(LOG_ERR) << "Failure to obtain current rlimit nofile. Not setting new limit.";
+        return;
+    }
+
+    const rlim_t nofile = std::min<rlim_t>(current.rlim_max, settings.rlimitNoFile);
+    logger->log(LOG_INFO)
+        << "Setting rlimit nofile to " << nofile << ", minimum of current hard limit ("
+        << current.rlim_max << ") and config file (" << settings.rlimitNoFile << ").";
+    const struct rlimit v = { nofile, nofile };
     if (setrlimit(RLIMIT_NOFILE, &v) < 0)
     {
-        logger->logf(LOG_ERR, "Setting ulimit nofile failed: '%s'. This means the default is used. Note. It's also subject to systemd's 'LimitNOFILE', "
-                              "which in turn is maxed to '/proc/sys/fs/nr_open', which can be set like 'sysctl fs.nr_open=15000000'", strerror(errno));
+        logger->log(LOG_ERR)
+            << "Setting ulimit nofile failed: '" << strerror(errno) << "'. This means the default is used. Note. It's also subject to systemd's 'LimitNOFILE', "
+            << "which in turn is maxed to '/proc/sys/fs/nr_open', which can be set like 'sysctl fs.nr_open=15000000'";
     }
 }
 
@@ -1154,7 +1169,7 @@ void MainApp::loadConfig(bool reload)
 
     for (ThreadDataOwner &thread : threads)
     {
-        thread->queueReload(settings);
+        thread.callIfThread(&ThreadData::queueReload, settings);
     }
 
     if (reload)
@@ -1299,8 +1314,7 @@ void MainApp::queueCleanup()
     if (!threads.empty())
     {
         int threadnr = rand() % threads.size();
-        std::shared_ptr<ThreadData> t = threads[threadnr].getThreadData();
-        t->queueRemoveExpiredSessions();
+        threads[threadnr].callIfThread(&ThreadData::queueRemoveExpiredSessions);
     }
 }
 
@@ -1309,8 +1323,7 @@ void MainApp::queuePurgeSubscriptionTree()
     if (!threads.empty())
     {
         int threadnr = rand() % threads.size();
-        std::shared_ptr<ThreadData> t = threads[threadnr].getThreadData();
-        t->queuePurgeSubscriptionTree();
+        threads[threadnr].callIfThread(&ThreadData::queuePurgeSubscriptionTree);
     }
 }
 

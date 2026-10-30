@@ -1,3 +1,15 @@
+flashmq (1.27.3.0) stable; urgency=medium
+
+  * Merge v1.27.3.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Fri, 30 Oct 2026 21:57:35 +0100
+
+flashmq (1.26.1-4) stable; urgency=medium
+
+  * Autobuild.
+
+ -- root <matthias@urlichs.de>  Wed, 29 Apr 2026 06:49:51 +0200
+
 flashmq (1.26.1-2) stable; urgency=medium
 
   * Install flashmq_public.h

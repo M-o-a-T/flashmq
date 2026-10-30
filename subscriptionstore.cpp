@@ -409,7 +409,7 @@ void SubscriptionStore::sendWill(const std::shared_ptr<WillPublish> will, const 
     logger->log(LOG_DEBUG) << log << " " << will->topic;
 
     Authentication &auth = ThreadGlobals::getThreadData()->authentication;
-    const AuthResult authResult = auth.aclCheck(*will, will->payload, AclAccess::write);
+    const AuthResult authResult = auth.aclWriteCheck(*will, will->payload, AclAccess::write);
 
     if (authResult == AuthResult::success || authResult == AuthResult::success_without_setting_retained)
     {
@@ -420,7 +420,7 @@ void SubscriptionStore::sendWill(const std::shared_ptr<WillPublish> will, const 
         queuePacketAtSubscribers(factory, will->client_id, {});
 
         if (will->retain && authResult == AuthResult::success)
-            setRetainedMessage(*will, will->getSubtopics());
+            setRetainedMessage(*will, will->getSubtopics(), false, false);
     }
 }
 
@@ -528,6 +528,15 @@ void SubscriptionStore::publishNonRecursively(
         }
 
         if (sub.noLocal && targetSessions.back().session->getClientId() == senderClientId)
+        {
+            targetSessions.pop_back();
+            continue;
+        }
+
+        // We will soon support explicitely configuring the 'routing_group_id' (user-facing name for it), so
+        // check on non-shared subscriptions too.
+        const std::optional<std::string> &session_group_id = targetSessions.back().session->getFmqClientGroupId();
+        if (session_group_id && session_group_id == fmq_client_group_id)
         {
             targetSessions.pop_back();
             continue;
@@ -703,7 +712,7 @@ void SubscriptionStore::giveClientRetainedMessagesRecursively(std::vector<std::s
             if (!rm.hasExpired()) // We can't also erase here, because we're operating under a read lock.
             {
                 Publish publish = rm.publish;
-                if (auth.aclCheck(publish, publish.payload) == AuthResult::success)
+                if (auth.aclWriteCheck(publish, publish.payload) == AuthResult::success)
                 {
                     PublishCopyFactory copyFactory(&publish);
                     const PacketDropReason drop_reason = session->writePacket(copyFactory, max_qos, true, subscription_identifier);
@@ -933,7 +942,7 @@ void SubscriptionStore::trySetRetainedMessages(const Publish &publish, const std
     td->retainedMessageSet.inc(1);
 
     // Only do direct setting when there are none queued, to avoid out of order races, which would result in the wrong ultimate value.
-    if (td->queuedRetainedMessagesEmpty() && setRetainedMessage(publish, subtopics, try_lock_fail))
+    if (td->queuedRetainedMessagesEmpty() && setRetainedMessage(publish, subtopics, false, try_lock_fail))
         return;
 
     auto spread {settings->setRetainedMessageDeferTimeoutSpread};
@@ -949,23 +958,61 @@ void SubscriptionStore::trySetRetainedMessages(const Publish &publish, const std
     td->queueSettingRetainedMessage(publish, subtopics, limit);
 }
 
-bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::vector<std::string> &subtopics, bool try_lock_fail)
+bool SubscriptionStore::setRetainedLimitReached(const Settings *settings, const RetainedMessageNode *node, const std::vector<std::string> &subtopics)
+{
+    if (!node)
+        return false;
+
+    if (subtopics.at(0) == std::string_view("$SYS"))
+        return false;
+
+    if (node->recursiveChildCount < settings->retainedMessagesNodeCreationLimit)
+        return false;
+
+    const bool do_log = retainedMessagesNodesLimitsLogged.shared_lock()->count(node) == 0;
+    const bool result = settings->retainedMessagesNodeCreationLimitEnforcementMode == RetainedMessagesNodeCreationLimitEnforcementMode::Reject;
+
+    if (!do_log)
+        return result;
+
+    retainedMessagesNodesLimitsLogged.unique_lock()->insert(node);
+
+    std::string msg("Limit reached setting retained message for topic '" + recompose_topic(subtopics) + "'.");
+
+    if (result)
+        msg.append(" Rejecting.");
+    else
+        msg.append(" Logging warning only.");
+
+    Logger::getInstance()->log(LOG_WARNING) << msg;
+
+    return result;
+}
+
+bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::vector<std::string> &subtopics, const bool dollar, bool try_lock_fail)
 {
     assert(!subtopics.empty());
+    assert(recompose_topic(subtopics) == publish.topic);
+
+    // Ignore for the same reason in queuePacketAtSubscribers.
+    if (!dollar && !publish.topic.empty() && publish.topic[0] == '$')
+        return true;
 
     const Settings *settings = ThreadGlobals::getSettings();
 
     if (settings->retainedMessagesMode >= RetainedMessagesMode::EnabledWithoutRetaining)
         return true;
 
-    const std::shared_ptr<RetainedMessageNode> *deepestNode = &retainedMessagesRoot;
-    if (!subtopics.empty() && !subtopics[0].empty() > 0 && subtopics[0][0] == '$')
-        deepestNode = &retainedMessagesRootDollar;
+    const std::shared_ptr<RetainedMessageNode> *deepestNode = dollar ? &retainedMessagesRootDollar : &retainedMessagesRoot;
+
+    std::shared_ptr<RetainedMessageNode> enforcement_node;
 
     bool needsWriteLock = false;
     auto subtopic_pos = subtopics.begin();
     std::shared_ptr<RetainedMessageNode> selected_node;
     std::shared_ptr<RetainedMessageNode> retry_point;
+
+    int cur_level = 0;
 
     // First do a read-only search for the node.
     {
@@ -980,6 +1027,12 @@ bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::ve
 
         while(subtopic_pos != subtopics.end())
         {
+            if (!enforcement_node && cur_level >= settings->retainedMessagesNodeCreationLimitEnforcementDepth)
+                enforcement_node = *deepestNode;
+
+            if (enforcement_node && setRetainedLimitReached(settings, enforcement_node.get(), subtopics))
+                return true;
+
             auto pos = (*deepestNode)->children.find(*subtopic_pos);
 
             if (pos == (*deepestNode)->children.end())
@@ -999,6 +1052,7 @@ bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::ve
             }
             deepestNode = &selectedChildren;
             subtopic_pos++;
+            cur_level++;
         }
 
         assert(deepestNode);
@@ -1020,18 +1074,30 @@ bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::ve
         else
             locker.wrlock();
 
+        // In other words, these nodes are not orphaned. If they are, there is a bug, like the purger interfering between when we went
+        // from read lock to write lock.
+        assert(retry_point.use_count() > 1);
+        assert(!enforcement_node || enforcement_node.use_count() > 1);
+
         deepestNode = &retry_point;
 
         while(subtopic_pos != subtopics.end())
         {
+            if (!enforcement_node && cur_level >= settings->retainedMessagesNodeCreationLimitEnforcementDepth)
+                enforcement_node = *deepestNode;
+
+            if (enforcement_node && setRetainedLimitReached(settings, enforcement_node.get(), subtopics))
+                return true;
+
             std::shared_ptr<RetainedMessageNode> &selectedChildren = (*deepestNode)->children[*subtopic_pos];
 
             if (!selectedChildren)
             {
-                selectedChildren = std::make_shared<RetainedMessageNode>();
+                selectedChildren = std::make_shared<RetainedMessageNode>(*deepestNode);
             }
             deepestNode = &selectedChildren;
             subtopic_pos++;
+            cur_level++;
         }
 
         assert(deepestNode);
@@ -1042,12 +1108,28 @@ bool SubscriptionStore::setRetainedMessage(const Publish &publish, const std::ve
         }
     }
 
-    if (selected_node)
+    assert(cur_level == static_cast<int>(subtopics.size()));
+
+    if (!selected_node)
+        return true;
+
+    if (publish.payload.size() <= settings->retainedMessageMaxPayloadSize)
     {
         const ssize_t diff = selected_node->addPayload(publish);
 
         if (diff != 0)
             this->retainedMessageCount.fetch_add(diff);
+    }
+    else
+    {
+        if (retainedMessagesNodesLimitsLogged.shared_lock()->count(selected_node.get()) == 0)
+        {
+            retainedMessagesNodesLimitsLogged.unique_lock()->insert(selected_node.get());
+
+            Logger::getInstance()->log(LOG_WARNING)
+                << "Payload size of " << publish.payload.size() << " exceeded max of " << settings->retainedMessageMaxPayloadSize
+                << " for " << recompose_topic(subtopics);
+        }
     }
 
     return true;
@@ -1346,6 +1428,7 @@ bool SubscriptionStore::expireRetainedMessages()
         RWLockGuard lock_guard(&retainedMessagesRwlock);
         lock_guard.wrlock();
         retainedMessageDeferredCounter = 0;
+        retainedMessagesNodesLimitsLogged.unique_lock()->clear();
         this->expireRetainedMessages(retainedMessagesRoot.get(), limit, deferredRetainedMessageNodeToPurge, retainedMessageDeferredCounter);
 
         logger->log(LOG_INFO) << "Expiring retained messages done, with " << deferredRetainedMessageNodeToPurge.size() << " deferred nodes to check.";
@@ -1550,26 +1633,30 @@ void SubscriptionStore::expireRetainedMessages(
     if (this_node->message)
         real_message_counter++;
 
-    auto cpos = this_node->children.begin();
-    while (cpos != this_node->children.end())
+    for (auto _ = this_node->children.begin(); _ != this_node->children.end(); )
     {
-        auto cur = cpos;
-        cpos++;
-
-        if (std::chrono::steady_clock::now() > limit)
-        {
-            deferred.push_back(cur->second);
-            continue;
-        }
-
+        auto cur = _;
+        _++;
         const std::shared_ptr<RetainedMessageNode> &child = cur->second;
-        expireRetainedMessages(child.get(), limit, deferred, real_message_counter);
+
+        if (std::chrono::steady_clock::now() <= limit)
+            expireRetainedMessages(child.get(), limit, deferred, real_message_counter);
+
+        // See setRetainedMessage(..). It does two stage (re) locking, so we need to check this.
+        if (child.use_count() > 1)
+            continue;
 
         if (child->isOrphaned())
         {
             const Settings *settings = ThreadGlobals::getSettings();
             if (child->getMessageSetAt() + settings->retainedMessageNodeLifetime < std::chrono::steady_clock::now())
+            {
                 this_node->children.erase(cur);
+            }
+        }
+        else if (std::chrono::steady_clock::now() > limit)
+        {
+            deferred.push_back(child);
         }
     }
 }
@@ -1641,7 +1728,7 @@ void SubscriptionStore::loadRetainedMessages(const std::string &filePath)
 
             for (RetainedMessage &rm : messages)
             {
-                setRetainedMessage(rm.publish, rm.publish.getSubtopics());
+                setRetainedMessage(rm.publish, rm.publish.getSubtopics(), false, false);
             }
         } while (count > 0);
 
@@ -1785,6 +1872,32 @@ bool RetainedMessageNode::isOrphaned() const
 const std::chrono::time_point<std::chrono::steady_clock> RetainedMessageNode::getMessageSetAt() const
 {
     return this->messageSetAt;
+}
+
+void RetainedMessageNode::propagateChildCountIncrement()
+{
+    for (auto cur = this->parent.lock(); cur; cur = cur->parent.lock())
+    {
+        cur->recursiveChildCount++;
+    }
+}
+
+RetainedMessageNode::RetainedMessageNode(const std::shared_ptr<RetainedMessageNode> &parent) :
+    parent(parent)
+{
+    propagateChildCountIncrement();
+}
+
+RetainedMessageNode::~RetainedMessageNode()
+{
+    // If this happens, deletion happens in the middle of the tree, and likely as part of program termination or something.
+    if (!children.empty())
+        return;
+
+    for (auto cur = this->parent.lock(); cur; cur = cur->parent.lock())
+    {
+        cur->recursiveChildCount--;
+    }
 }
 
 QueuedWill::QueuedWill(const std::shared_ptr<WillPublish> &will, const std::shared_ptr<Session> &session) :

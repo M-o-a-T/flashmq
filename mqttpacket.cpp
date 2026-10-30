@@ -13,6 +13,7 @@ See LICENSE for license details.
 #include <iostream>
 #include <list>
 #include <cassert>
+#include <bit>
 
 #include "globals.h"
 #include "threaddata.h"
@@ -20,6 +21,27 @@ See LICENSE for license details.
 #include "utils.h"
 #include "subscriptionstore.h"
 #include "acksender.h"
+
+uint8_t generate_first_byte(const PacketType type)
+{
+    unsigned int lsb = 0;
+
+    switch (type)
+    {
+    case PacketType::PUBREL:
+    case PacketType::SUBSCRIBE:
+    case PacketType::UNSUBSCRIBE:
+        lsb = 2;
+        break;
+    default:
+        break;
+    }
+
+    unsigned int x { static_cast<unsigned int>(type) << 4 };
+    x = { x | lsb };
+    const uint8_t result { static_cast<uint8_t>(x & 0xFF) };
+    return result;
+}
 
 // constructor for parsing incoming packets
 MqttPacket::MqttPacket(std::vector<char> &&packet_bytes, size_t fixed_header_length, std::shared_ptr<Client> &sender) :
@@ -33,18 +55,29 @@ MqttPacket::MqttPacket(std::vector<char> &&packet_bytes, size_t fixed_header_len
         throw ProtocolError("Incoming packet size exceeded.", ReasonCodes::PacketTooLarge);
 
     protocolVersion = sender->getProtocolVersion();
-    first_byte = bites[0];
-    unsigned char _packetType = (first_byte & 0xF0) >> 4;
-    packetType = (PacketType)_packetType;
+    first_byte = std::bit_cast<uint8_t>(bites[0]);
+    packetType = static_cast<PacketType>((first_byte & 0xF0) >> 4);
     pos += fixed_header_length;
     externallyReceived = true;
+
+    if (packetType == PacketType::Reserved || (this->protocolVersion < ProtocolVersion::Mqtt5 && packetType > PacketType::DISCONNECT))
+    {
+        if (this->protocolVersion == ProtocolVersion::None)
+            throw BadClientException("Likely not an MQTT client");
+
+        throw ProtocolError(
+            "Packet type " + packetTypeToString(packetType) + " invalid for protocol version " + protocolVersionString(this->protocolVersion),
+            ReasonCodes::MalformedPacket);
+    }
+
+    validateFirstByteLSB();
 }
 
 MqttPacket::MqttPacket(const ConnAck &connAck) :
     bites(connAck.getLengthWithoutFixedHeader())
 {
     packetType = PacketType::CONNACK;
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
     writeByte(connAck.session_present & 0b00000001); // all connect-ack flags are 0, except session-present. [MQTT-3.2.2.1]
     writeByte(connAck.return_code);
 
@@ -62,7 +95,7 @@ MqttPacket::MqttPacket(const SubAck &subAck) :
     bites(subAck.getLengthWithoutFixedHeader())
 {
     packetType = PacketType::SUBACK;
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
     writeUint16(subAck.packet_id);
 
     if (subAck.protocol_version >= ProtocolVersion::Mqtt5)
@@ -87,7 +120,7 @@ MqttPacket::MqttPacket(const UnsubAck &unsubAck) :
     bites(unsubAck.getLengthWithoutFixedHeader())
 {
     packetType = PacketType::UNSUBACK;
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
     writeUint16(unsubAck.packet_id);
 
     if (unsubAck.protocol_version >= ProtocolVersion::Mqtt5)
@@ -140,7 +173,7 @@ MqttPacket::MqttPacket(const ProtocolVersion protocolVersion, const Publish &_pu
         throw ProtocolError("Topic path too long.", ReasonCodes::ProtocolError);
     }
 
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
     first_byte |= (this->publishData.qos << 1);
     first_byte |= (static_cast<char>(publishData.retain) & 0b00000001);
 
@@ -204,10 +237,10 @@ MqttPacket::MqttPacket(const PubResponse &pubAck) :
     bites(pubAck.getLengthIncludingFixedHeader())
 {
     this->protocolVersion = pubAck.protocol_version;
+    this->packetType = pubAck.packet_type;
 
     fixed_header_length = 2;
-    const uint8_t firstByteDefaultBits = pubAck.packet_type == PacketType::PUBREL ? 0b0010 : 0;
-    this->first_byte = (static_cast<uint8_t>(pubAck.packet_type) << 4) | firstByteDefaultBits;
+    this->first_byte = generate_first_byte(packetType);
     writeByte(first_byte);
     writeByte(pubAck.getRemainingLength());
     this->packet_id_pos = this->pos;
@@ -232,7 +265,7 @@ MqttPacket::MqttPacket(const Disconnect &disconnect) :
     this->protocolVersion = disconnect.protocolVersion;
 
     packetType = PacketType::DISCONNECT;
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
 
     if (this->protocolVersion >= ProtocolVersion::Mqtt5)
     {
@@ -248,7 +281,7 @@ MqttPacket::MqttPacket(const Auth &auth) :
     protocolVersion(ProtocolVersion::Mqtt5),
     packetType(PacketType::AUTH)
 {
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
 
     writeByte(static_cast<uint8_t>(auth.reasonCode));
     writeProperties(auth.propertyBuilder);
@@ -259,7 +292,7 @@ MqttPacket::MqttPacket(const Connect &connect) :
     protocolVersion(connect.protocolVersion),
     packetType(PacketType::CONNECT)
 {
-    first_byte = static_cast<char>(packetType) << 4;
+    first_byte = generate_first_byte(packetType);
     const std::string_view magicString = connect.getMagicString();
 
     std::optional<Mqtt5PropertyBuilder> properties;
@@ -280,6 +313,9 @@ MqttPacket::MqttPacket(const Connect &connect) :
 
     if (connect.fmq_client_group_id)
         non_optional(properties)->writeUserProperty(FMQ_CLIENT_GROUP_ID, connect.fmq_client_group_id.value());
+
+    if (connect.clientid_prefix)
+        non_optional(properties)->writeUserProperty(FMQ_CLIENT_ID_PREFIX, connect.clientid_prefix.value());
 
     std::optional<Mqtt5PropertyBuilder> will_properties;
 
@@ -372,8 +408,7 @@ MqttPacket::MqttPacket(const ProtocolVersion protocolVersion, const uint16_t pac
 {
     assert(!subscriptions.empty());
 
-    first_byte = static_cast<char>(packetType) << 4;
-    first_byte |= 2; // required reserved bit
+    first_byte = generate_first_byte(packetType);
 
     std::optional<Mqtt5PropertyBuilder> properties;
 
@@ -433,8 +468,7 @@ MqttPacket::MqttPacket(const ProtocolVersion protocolVersion, const uint16_t pac
     throw NotImplementedException("Code is only for testing.");
 #endif
 
-    first_byte = static_cast<char>(packetType) << 4;
-    first_byte |= 2; // required reserved bit
+    first_byte = generate_first_byte(packetType);
 
     std::optional<Mqtt5PropertyBuilder> properties;
 
@@ -648,6 +682,8 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
     // Even though we're still parsing, setting this helps the exception handler to make decisions.
     sender->setProtocolVersion(this->protocolVersion);
 
+    validateFirstByteLSB();
+
     char flagByte = readByte();
     bool reserved = !!(flagByte & 0b00000001);
 
@@ -768,9 +804,13 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
         }
 
         result.fmq_client_group_id = publishData.getFirstUserProperty(FMQ_CLIENT_GROUP_ID);
+        result.client_id_prefix = publishData.getFirstUserProperty(FMQ_CLIENT_ID_PREFIX);
 
         if (result.fmq_client_group_id.has_value() && result.fmq_client_group_id.value().size() > 24)
             throw ProtocolError("FMQ Client group ID can't be longer than 24 chars.", ReasonCodes::ImplementationSpecificError);
+
+        if (result.client_id_prefix.has_value() && result.client_id_prefix.value().length() > 12)
+            throw ProtocolError("User property with client ID prefix is too long.", ReasonCodes::ImplementationSpecificError);
     }
 
     if (result.authenticationMethod.empty() && !result.authenticationData.empty())
@@ -782,6 +822,9 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
     }
 
     result.client_id = readBytesToString(settings.maxStringLength);
+
+    if (result.client_id_prefix && (result.client_id_prefix.value().empty() || !startsWith(result.client_id, result.client_id_prefix.value())))
+        throw ProtocolError("Client ID prefix must a substring of client ID", ReasonCodes::ImplementationSpecificError);
 
     if (result.will_flag)
     {
@@ -890,7 +933,7 @@ ConnectData MqttPacket::parseConnectData(std::shared_ptr<Client> &sender)
         uint16_t will_payload_length = readTwoBytesToUInt16();
         result.willpublish.payload = readBytes(will_payload_length);
 
-        if (result.willpublish.payloadUtf8 && !isValidUtf8Generic(result.willpublish.payload))
+        if (result.willpublish.payloadUtf8 && !isValidUtf8(result.willpublish.payload))
         {
             throw ProtocolError("Will payload announced as UTF8, but it's not valid.", ReasonCodes::PayloadFormatInvalid);
         }
@@ -1113,8 +1156,6 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
     if (sender->hasConnectPacketSeen())
         throw ProtocolError("Client already sent a CONNECT.", ReasonCodes::ProtocolError);
 
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-
     auto &threadData = ThreadGlobals::getThreadData();
     Authentication &authentication = threadData->authentication;
 
@@ -1181,8 +1222,9 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
     }
 
     sender->setClientId(connectData.client_id);
+    sender->setClientIdPrefix(connectData.client_id_prefix);
 
-    std::string username = connectData.username ? connectData.username.value() : "";
+    std::optional<std::string> username = connectData.username;
 
     if (sender->getX509ClientVerification() > X509ClientVerification::None && sender->getHaProxyMode() >= HaProxyMode::HaProxyClientVerification)
     {
@@ -1209,7 +1251,7 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
         username = haproxy_username.value();
     }
 
-    sender->setClientProperties(protocolVersion, connectData.client_id, connectData.fmq_client_group_id, username, true, connectData.keep_alive,
+    sender->setClientProperties(protocolVersion, connectData.client_id, connectData.fmq_client_group_id, username.value_or(""), true, connectData.keep_alive,
                                 connectData.max_outgoing_packet_size, connectData.max_outgoing_topic_aliases);
 
     if (settings.willsEnabled && connectData.will_flag)
@@ -1234,7 +1276,7 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
 
         if (protocolVersion >= ProtocolVersion::Mqtt311 && !connectData.clean_start)
         {
-            existingSession = subscriptionStore->lockSession(connectData.client_id);
+            existingSession = globals->subscriptionStore.lockSession(connectData.client_id);
             if (existingSession && !existingSession->getDestroyOnDisconnect())
                 sessionPresent = true;
         }
@@ -1280,7 +1322,7 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
         allowAnonymous = sender->getAllowAnonymousOverride() == AllowListenerAnonymous::Yes;
     }
 
-    if (!connectData.username && connectData.authenticationMethod.empty() && allowAnonymous)
+    if (!username && connectData.authenticationMethod.empty() && allowAnonymous)
     {
         authResult = AuthResult::success;
     }
@@ -1291,7 +1333,7 @@ void MqttPacket::handleConnect(std::shared_ptr<Client> &sender)
     }
     else if (connectData.authenticationMethod.empty())
     {
-        authResult = authentication.loginCheck(connectData.client_id, username, connectData.password, getUserProperties(), sender, allowAnonymous);
+        authResult = authentication.loginCheck(connectData.client_id, username.value_or(""), connectData.password, getUserProperties(), sender, allowAnonymous);
     }
     else
     {
@@ -1346,7 +1388,6 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
 
     logger->logf(LOG_NOTICE, "Bridge '%s' connection established. Subscribing to topics.", sender->repr().c_str());
 
-    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
     std::shared_ptr<Session> session = bridgeState->session->lock();
 
     // Should be impossible.
@@ -1392,7 +1433,12 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
 
         if (!subscriptions.empty())
         {
-            MqttPacket subPacket(this->getProtocolVersion(), session->getNextPacketIdLocked(), 0, subscriptions);
+            std::optional<uint16_t> pack_id = session->getNextPacketIdLocked();
+
+            if (!pack_id)
+                throw std::runtime_error("No quota of packet IDs left to send bridge subscriptions after CONNACK? Should not be possible at this point.");
+
+            MqttPacket subPacket(this->getProtocolVersion(), pack_id.value(), 0, subscriptions);
             sender->writeMqttPacketAndBlameThisClient(subPacket);
         }
     }
@@ -1410,7 +1456,7 @@ void MqttPacket::handleConnAck(std::shared_ptr<Client> &sender)
         std::string _;
         parseSubscriptionShare(subtopics, shareName, _);
         const bool no_local = shareName.empty(); // See above about no-local.
-        store->addSubscription(session, subtopics, pub.qos, no_local, true, shareName, 0);
+        globals->subscriptionStore.addSubscription(session, subtopics, pub.qos, no_local, true, shareName, 0);
     }
 
     ThreadGlobals::getThreadData()->publishBridgeState(bridgeState, true, {});
@@ -1827,9 +1873,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
         if (tup.authResult == AuthResult::success_but_drop)
             continue;
 
-        auto store = globals->subscriptionStore;
-
-        const AddSubscriptionType add_type = store->addSubscription(
+        const AddSubscriptionType add_type = globals->subscriptionStore.addSubscription(
             session, tup.subtopics, tup.qos, tup.noLocal, tup.retainAsPublished, tup.shareName, tup.subscriptionIdentifier);
 
         if (tup.authResult == AuthResult::success && tup.shareName.empty())
@@ -1837,7 +1881,7 @@ void MqttPacket::handleSubscribe(std::shared_ptr<Client> &sender)
             if ((tup.retainHandling == RetainHandling::SendRetainedMessagesAtSubscribe) ||
                 (tup.retainHandling == RetainHandling::SendRetainedMessagesAtNewSubscribeOnly && add_type == AddSubscriptionType::NewSubscription) )
             {
-                store->giveClientRetainedMessages(session, tup.subtopics, tup.qos, tup.subscriptionIdentifier);
+                globals->subscriptionStore.giveClientRetainedMessages(session, tup.subtopics, tup.qos, tup.subscriptionIdentifier);
             }
         }
     }
@@ -1849,6 +1893,13 @@ void MqttPacket::handleSubAck(std::shared_ptr<Client> &sender)
         return;
 
     const SubAckData data = parseSubAckData();
+
+    if (logger->wouldLog(LOG_SUBSCRIBE))
+    {
+        logger->log(LOG_SUBSCRIBE)
+            << "SUBACK received from '" << sender->getClientId()
+            << "' with id " << data.packet_id << " having " << data.subAckCodes.size() << " ack(s) in it.";
+    }
 
     std::shared_ptr<BridgeState> bridgeState = sender->getBridgeState();
 
@@ -1862,7 +1913,7 @@ void MqttPacket::handleSubAck(std::shared_ptr<Client> &sender)
     if (!session)
         return;
 
-    session->increaseFlowControlQuotaLocked();
+    session->increaseFlowControlQuotaLocked(data.packet_id);
 }
 
 void MqttPacket::handleUnsubscribe(std::shared_ptr<Client> &sender)
@@ -1926,7 +1977,7 @@ void MqttPacket::handleUnsubscribe(std::shared_ptr<Client> &sender)
         std::string topic_without_sharename = topic;
         parseSubscriptionShare(subtopics, shareName, topic_without_sharename);
 
-        globals->subscriptionStore->removeSubscription(session, subtopics, shareName);
+        globals->subscriptionStore.removeSubscription(session, subtopics, shareName);
 
         const Authentication &auth = ThreadGlobals::getThreadData()->authentication;
         auth.onUnsubscribe(session, sender->getClientId(), sender->getUsername(), topic_without_sharename, subtopics, shareName, getUserProperties());
@@ -2104,8 +2155,7 @@ void MqttPacket::parsePublishData(std::shared_ptr<Client> &sender)
     payloadLen = remainingAfterPos();
     payloadStart = pos;
 
-    // Not using SIMD UTF8 checker because that requires making a copy, and requires being able to deal with large strings.
-    if (publishData.payloadUtf8 && !isValidUtf8Generic(getPayloadView()))
+    if (publishData.payloadUtf8 && !isValidUtf8(getPayloadView()))
     {
         throw ProtocolError("Payload announced as UTF8, but it's not valid.", ReasonCodes::PayloadFormatInvalid);
     }
@@ -2166,7 +2216,7 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
     const uint16_t _packet_id = this->packet_id;
 
     // Stage the ack, with the proper ID.
-    AckSender ackSender(this->publishData.qos, this->packet_id, this->protocolVersion, sender);
+    AckSender ackSender(this->publishData.qos, this->packet_id, this->protocolVersion);
 
     if (publishData.retain && settings->retainedMessagesMode == RetainedMessagesMode::DisconnectWithError)
     {
@@ -2181,12 +2231,12 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
         }
         else if (sender->getMqtt3QoSExceedAction() == Mqtt3QoSExceedAction::Drop)
         {
-            ackSender.sendNow();
+            ackSender.sendNow(sender.get());
         }
     }
     else if (publishData.qos == 2 && sender->getSession()->incomingQoS2MessageIdInTransit(_packet_id))
     {
-        ackSender.setAckCode(ReasonCodes::PacketIdentifierInUse);
+        ackSender.setAckCode(ReasonCodes::Success);
     }
     else
     {
@@ -2211,7 +2261,7 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
         if (altered || qos_org != this->publishData.qos)
             this->dontReuseBites = true;
 
-        const AuthResult authResult = authentication.aclCheck(this->publishData, getPayloadView());
+        const AuthResult authResult = authentication.aclWriteCheck(this->publishData, getPayloadView());
         if (authResult == AuthResult::success || authResult == AuthResult::success_without_setting_retained)
         {
             if (publishData.retain)
@@ -2219,13 +2269,13 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
                 if (authResult == AuthResult::success && settings->retainedMessagesMode <= RetainedMessagesMode::EnabledWithoutPersistence)
                 {
                     publishData.payload = getPayloadCopy();
-                    globals->subscriptionStore->trySetRetainedMessages(publishData, publishData.getSubtopics());
+                    globals->subscriptionStore.trySetRetainedMessages(publishData, publishData.getSubtopics());
                 }
                 else if (settings->retainedMessagesMode == RetainedMessagesMode::Downgrade)
                 {
                     publishData.retain = false;
                     bites[0] &= 0b11111110;
-                    first_byte = bites[0];
+                    first_byte = std::bit_cast<uint8_t>(bites[0]);
                 }
             }
 
@@ -2233,16 +2283,16 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
             {
                 // Set dup flag to 0, because that must not be propagated [MQTT-3.3.1-3].
                 bites[0] &= 0b11110111;
-                first_byte = bites[0];
+                first_byte = std::bit_cast<uint8_t>(bites[0]);
 
                 PublishCopyFactory factory(this);
-                ackSender.sendNow();
-                globals->subscriptionStore->queuePacketAtSubscribers(factory, sender->getClientId(), sender->getFmqClientGroupId());
+                ackSender.sendNow(sender.get());
+                globals->subscriptionStore.queuePacketAtSubscribers(factory, sender->getClientId(), sender->getFmqClientGroupId());
             }
         }
         else if (authResult == AuthResult::success_but_drop_publish)
         {
-            ackSender.sendNow();
+            ackSender.sendNow(sender.get());
         }
         else
         {
@@ -2257,6 +2307,8 @@ void MqttPacket::handlePublish(std::shared_ptr<Client> &sender)
     if (publishData.qos > 0)
         this->setPacketId(0);
 #endif
+
+    ackSender.sendNow(sender.get());
 }
 
 void MqttPacket::parsePubAckData()
@@ -2474,6 +2526,46 @@ bool MqttPacket::withinBound(const size_t limit) const
     return pos < limit;
 }
 
+void MqttPacket::validateFirstByteLSB() const
+{
+    // In MQTT3, the four LSB technically have a value. This check also means it does nothing for new
+    // clients, whose connect packet hasn't been parsed yet.
+    if (this->protocolVersion < ProtocolVersion::Mqtt311)
+        return;
+
+    const unsigned int four_lsb = first_byte & 0x0F;
+    std::optional<unsigned int> four_lsb_required;
+
+    switch(packetType)
+    {
+    case PacketType::CONNECT:
+    case PacketType::CONNACK:
+    case PacketType::PUBACK:
+    case PacketType::PUBREC:
+    case PacketType::PUBCOMP:
+    case PacketType::SUBACK:
+    case PacketType::UNSUBACK:
+    case PacketType::PINGREQ:
+    case PacketType::PINGRESP:
+    case PacketType::DISCONNECT:
+    case PacketType::AUTH:
+        four_lsb_required = 0;
+        break;
+    case PacketType::PUBREL:
+    case PacketType::SUBSCRIBE:
+    case PacketType::UNSUBSCRIBE:
+        four_lsb_required = 0b10;
+        break;
+    default:
+        break;
+    }
+
+    if (four_lsb_required && four_lsb != four_lsb_required)
+    {
+        throw ProtocolError(packetTypeToString(packetType) + " has malformed four LSB in first byte", ReasonCodes::MalformedPacket);
+    }
+}
+
 void MqttPacket::setPacketId(uint16_t packet_id)
 {
     assert(fixed_header_length == 0 || first_byte == bites[0]);
@@ -2610,12 +2702,12 @@ uint8_t MqttPacket::readUint8()
     return static_cast<uint8_t>(r);
 }
 
-void MqttPacket::writeByte(char b)
+void MqttPacket::writeByte(uint8_t b)
 {
     if (pos + 1 > bites.size())
         throw ProtocolError("Exceeding packet size", ReasonCodes::MalformedPacket);
 
-    bites[pos++] = b;
+    bites[pos++] = std::bit_cast<char>(b);
 }
 
 void MqttPacket::writeUint16(uint16_t x)

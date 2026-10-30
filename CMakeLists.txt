@@ -3,12 +3,12 @@ cmake_policy(SET CMP0048 NEW)
 include(CheckCXXCompilerFlag)
 include(CMakeLists.shared)
 
-project(FlashMQ VERSION 1.26.1 LANGUAGES CXX)
+project(FlashMQ VERSION 1.27.3 LANGUAGES CXX)
 
 add_definitions(-DOPENSSL_API_COMPAT=0x10100000L)
 add_definitions(-DFLASHMQ_VERSION=\"${PROJECT_VERSION}\")
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (FMQ_ASAN)

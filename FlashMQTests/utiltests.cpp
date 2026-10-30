@@ -7,6 +7,7 @@
 #include "exceptions.h"
 #include "conffiletemp.h"
 #include "nocopy.h"
+#include "usedids.h"
 
 void MainTests::testStringValuesParsing()
 {
@@ -305,6 +306,249 @@ void MainTests::testBase64()
     const std::string b64 = base64Encode(bytes.data(), bytes.size());
     const auto decoded = base64Decode(b64);
     FMQ_COMPARE(decoded, bytes);
+}
+
+void MainTests::testUsedIds()
+{
+    UsedIds ids;
+
+    for (uint16_t i = 1; i < 128; i++)
+    {
+        ids.insert(i);
+        FMQ_VERIFY(ids.contains(i));
+
+        for (uint16_t j = i; j < 128; j++)
+        {
+            if (i == j)
+                continue;
+
+            FMQ_VERIFY(!ids.contains(j));
+        }
+    }
+
+    for (uint16_t i = 1; i < 128; i++)
+    {
+        ids.erase(i);
+        FMQ_VERIFY(!ids.contains(i));
+
+        for (uint16_t j = i; j < 128; j++)
+        {
+            if (i == j)
+                continue;
+
+            FMQ_VERIFY(ids.contains(j));
+        }
+    }
+
+    for (uint16_t i = 1; i < 128; i++)
+    {
+        ids.insert(i);
+        FMQ_VERIFY(ids.contains(i));
+
+        for (uint16_t j = i; j < 128; j++)
+        {
+            if (i == j)
+                continue;
+
+            FMQ_VERIFY(!ids.contains(j));
+        }
+    }
+}
+
+void MainTests::testUsedIds2()
+{
+    for (size_t x = 1; x < 10; x++)
+    {
+        UsedIds ids;
+        std::set<uint16_t> reference;
+
+        std::minstd_rand rnd;
+        rnd.seed(2344565676);
+
+        for (size_t i = 0; i < 100000; i++)
+        {
+            const uint16_t val = i % 65535 + 1;
+
+            if (rnd() % 9 < x)
+            {
+                reference.insert(val);
+                ids.insert(val);
+            }
+            else
+            {
+                ids.erase(val);
+                reference.erase(val);
+            }
+
+            FMQ_COMPARE(ids.contains(val), static_cast<bool>(reference.count(val)));
+        }
+
+        for (uint32_t i = 1; i <= 0xFFFF; i++)
+        {
+            //std::cout << i << ": " << ids.contains(i) << " " << reference.count(i) << std::endl;
+            FMQ_COMPARE(ids.contains(i), static_cast<bool>(reference.count(i)));
+        }
+    }
+}
+
+void MainTests::testUsedIds3()
+{
+    UsedIds ids;
+
+    for (size_t x = 1; x < 10; x++)
+    {
+        std::set<uint16_t> reference;
+
+        std::minstd_rand rnd;
+        rnd.seed(2344565676);
+
+        for (size_t i = 0; i < 100000; i++)
+        {
+            const uint16_t val = i % 65535 + 1;
+
+            if (rnd() % 9 < x)
+            {
+                reference.insert(val);
+                ids.insert(val);
+            }
+            else
+            {
+                ids.erase(val);
+                reference.erase(val);
+            }
+
+            FMQ_COMPARE(ids.contains(val), static_cast<bool>(reference.count(val)));
+        }
+
+        for (uint32_t i = 1; i <= 0xFFFF; i++)
+        {
+            //std::cout << i << ": " << ids.contains(i) << " " << reference.count(i) << std::endl;
+            FMQ_COMPARE(ids.contains(i), static_cast<bool>(reference.count(i)));
+        }
+
+        // This test works by not deleting 'ids' and clearing all packet IDs.
+        for (uint32_t i = 1; i <= 0xFFFF; i++)
+        {
+            ids.erase(i);
+        }
+    }
+}
+
+void MainTests::testUsedIds4()
+{
+    UsedIds ids;
+
+    for (int upper = 3; upper < 100; upper++)
+    {
+        for (uint16_t i = 1; i <= upper; i++)
+        {
+            ids.insert(i);
+        }
+
+        const uint16_t erase_me = upper - 2;
+        ids.erase(erase_me);
+
+        for (uint16_t i = 1; i <= upper; i++)
+        {
+            if (i == erase_me)
+                FMQ_VERIFY(!ids.contains(i));
+            else
+                FMQ_VERIFY(ids.contains(i));
+        }
+    }
+}
+
+void MainTests::testUsedIdsRandomDraining()
+{
+    std::minstd_rand rnd;
+    rnd.seed(1344676);
+
+    UsedIds ids;
+    std::set<uint16_t> reference;
+    std::vector<uint16_t> removals;
+
+    for (uint32_t id = 1; id <= 0xFFFF; id++)
+    {
+        ids.insert(id);
+        removals.push_back(id);
+        reference.insert(id);
+    }
+
+    std::shuffle(removals.begin(), removals.end(), rnd);
+
+    for (const uint16_t id : removals)
+    {
+        ids.erase(id);
+        reference.erase(id);
+
+        FMQ_COMPARE(ids.contains(id), static_cast<bool>(reference.count(id)));
+
+        if (reference.size() < 20 || reference.size() % 1000 == 0)
+        {
+            for (uint32_t id_to_test = 1; id_to_test <= 0xFFFF; id_to_test++)
+            {
+                FMQ_COMPARE(ids.contains(id_to_test), static_cast<bool>(reference.count(id_to_test)));
+            }
+        }
+    }
+}
+
+void MainTests::testUsedIdsSpeed()
+{
+    UsedIds ids;
+
+    std::minstd_rand rnd;
+    rnd.seed(2344565676);
+
+    for (uint32_t i = 0; i < 8; i++)
+    {
+        const uint16_t val = rnd();
+        ids.insert(val);
+    }
+
+    int a = 0;
+    int b = 0;
+
+    using namespace std::chrono;
+
+    const auto begin = steady_clock::now();
+
+    for (size_t i = 0; i < 1000000; i++)
+    {
+        uint16_t val = rnd();
+
+        if (val == 0)
+            val = 1;
+
+        if (ids.contains(val))
+            a++;
+        else
+            b++;
+    }
+
+    const auto end = steady_clock::now();
+    const auto duration = duration_cast<milliseconds>(end - begin);
+    std::cout << "testUsedIdsSpeed: " << duration.count() << " ms. Found=" << a << ". NotFound=" << b << "." << std::endl;
+    FMQ_VERIFY(a > 0 || b > 0);
+}
+
+void MainTests::test_contains_value_greater_than()
+{
+    {
+        std::vector<uint8_t> data(20);
+        FMQ_VERIFY(!contains_value_greater_than(data, 2));
+    }
+
+    {
+        std::vector<uint8_t> data {1,2,3,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5};
+        FMQ_VERIFY(contains_value_greater_than(data, 2));
+    }
+
+    {
+        std::vector<uint8_t> data {1,2,3,4,5};
+        FMQ_VERIFY(contains_value_greater_than(data, 2));
+    }
+
 }
 
 

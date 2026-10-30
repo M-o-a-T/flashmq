@@ -60,12 +60,23 @@ bool strContains(const std::string &s, const std::string &needle)
     return s.find(needle) != std::string::npos;
 }
 
+#ifdef TESTING
 // Only necessary for tests at this point.
 bool isValidUtf8Generic(const char *s, bool alsoCheckInvalidPublishChars)
 {
     const std::string s2(s);
     return isValidUtf8Generic(s2, alsoCheckInvalidPublishChars);
 }
+
+// Only necessary for tests at this point.
+#ifdef __SSE4_2__
+bool isValidUtf8Sse(const char *s, bool alsoCheckInvalidPublishChars)
+{
+    const std::string s2(s);
+    return isValidUtf8Sse(s2, alsoCheckInvalidPublishChars);
+}
+#endif
+#endif
 
 bool isValidPublishPath(const std::string &s)
 {
@@ -415,8 +426,7 @@ std::string_view dirnameOf(std::string_view path)
 
 size_t getFileSize(const std::string &path)
 {
-    struct stat statbuf;
-    memset(&statbuf, 0, sizeof(struct stat));
+    struct stat statbuf {};
     if (stat(path.c_str(), &statbuf) < 0)
         throw std::runtime_error("Can't get size of " + path);
 
@@ -428,8 +438,7 @@ size_t getFileSize(const std::string &path)
 
 uint64_t getFreeSpace(const std::string &path)
 {
-    struct statvfs statbuf;
-    memset(&statbuf, 0, sizeof(struct statvfs));
+    struct statvfs statbuf {};
 
     if (statvfs(path.c_str(), &statbuf) < 0)
         throw std::runtime_error("Can't get free space of " + path);
@@ -449,7 +458,7 @@ sa_family_t getFamilyFromSockAddr(const sockaddr *addr)
     if (!addr)
         return AF_UNSPEC;
 
-    sockaddr tmp;
+    sockaddr tmp {};
     std::memcpy(&tmp, addr, sizeof(tmp));
 
     return tmp.sa_family;
@@ -667,12 +676,14 @@ void parseSubscriptionShare(std::vector<std::string> &subtopics, std::string &sh
         throw ProtocolError("The / character after a shared subscription name MUST be followed by a topic filter.", ReasonCodes::ProtocolError);
 
     topic.clear();
+    bool first = true;
 
     for(const std::string &s : subtopics)
     {
-        if (!topic.empty())
+        if (!first)
             topic.append("/");
         topic.append(s);
+        first = false;
     }
 
     shareName = _shareName;
@@ -684,8 +695,7 @@ std::string timestampWithMillis()
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
     const time_t timer = std::chrono::system_clock::to_time_t(now);
 
-    struct tm my_tm;
-    memset(&my_tm, 0, sizeof(struct tm));
+    struct tm my_tm {};
     struct tm *my_tm_result = localtime_r(&timer, &my_tm);
 
     if (!my_tm_result)
@@ -968,8 +978,7 @@ void unlink_if_sock(const std::string &path)
     if (path.empty())
         return;
 
-    struct stat statbuf;
-    std::memset(&statbuf, 0, sizeof(statbuf));
+    struct stat statbuf {};
     if (lstat(path.c_str(), &statbuf) < 0)
         return;
 
@@ -987,9 +996,8 @@ void fmq_ensure_fail(const char *file, int line)
 
 std::optional<SysUserFields> get_pw_name(const std::string &user)
 {
-    struct passwd pwd;
+    struct passwd pwd {};
     struct passwd *result = nullptr;
-    std::memset(&pwd, 0, sizeof(pwd));
     std::vector<char> buf(16384);
 
     if (getpwnam_r(user.c_str(), &pwd, buf.data(), buf.size(), &result) != 0)
@@ -1011,9 +1019,8 @@ std::optional<SysUserFields> get_pw_name(const std::string &user)
 
 std::optional<SysGroupFields> get_gr_name(const std::string &group)
 {
-    struct group grp;
+    struct group grp {};
     struct group *result = nullptr;
-    std::memset(&grp, 0, sizeof(grp));
     std::vector<char> buf(16384);
 
     if (getgrnam_r(group.c_str(), &grp, buf.data(), buf.size(), &result) != 0)
@@ -1050,4 +1057,57 @@ std::optional<unsigned long> try_stoul(const std::string &s) noexcept
     }
 
     return {};
+}
+
+std::string recompose_topic(const std::vector<std::string> &subtopics)
+{
+    std::string result;
+    bool first = true;
+
+    for (const auto &s : subtopics)
+    {
+        if (!first)
+            result.push_back('/');
+        result.append(s);
+        first = false;
+    }
+
+    return result;
+}
+
+std::string redact_right(std::string s)
+{
+    const std::size_t start = s.size() / 2;
+    std::fill(s.begin() + start, s.end(), 'X');
+    return s;
+}
+
+bool contains_value_greater_than(const std::vector<uint8_t> &data, const uint8_t val)
+{
+    size_t i = 0;
+
+#ifdef __SSE4_2__
+    if (data.size() >= 16)
+    {
+        const __m128i val_vector = _mm_set1_epi8(val);
+
+        for (; i <= data.size() - 16; i += 16)
+        {
+            const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data.data() + i));
+            const __m128i clamped = _mm_min_epu8(x, val_vector);
+            const __m128i different = _mm_cmpeq_epi8(x, clamped);
+
+            if (_mm_movemask_epi8(different) != 0xFFFF)
+                return true;
+        }
+    }
+#endif
+
+    for (; i < data.size(); ++i)
+    {
+        if (data[i] > val)
+            return true;
+    }
+
+    return false;
 }

@@ -222,7 +222,9 @@ MainTests::MainTests()
     REGISTER_FUNCTION3(test_validUtf8Sse);
     REGISTER_FUNCTION3(test_utf8_nonchars);
     REGISTER_FUNCTION3(test_utf8_overlong);
+    REGISTER_FUNCTION3(test_utf8_ascii_range_among_multi_byte);
     REGISTER_FUNCTION3(test_utf8_compare_implementation);
+    REGISTER_FUNCTION3(test_utf8_compare_implementation2);
 #endif
 
     REGISTER_FUNCTION3(testPacketInt16Parse);
@@ -333,6 +335,13 @@ MainTests::MainTests()
     REGISTER_FUNCTION2(testPreviouslyValidConfigFile, false, false);
     REGISTER_FUNCTION3(testNoCopy);
     REGISTER_FUNCTION3(testBase64);
+    REGISTER_FUNCTION3(testUsedIds);
+    REGISTER_FUNCTION3(testUsedIds2);
+    REGISTER_FUNCTION3(testUsedIds3);
+    REGISTER_FUNCTION3(testUsedIds4);
+    REGISTER_FUNCTION3(testUsedIdsRandomDraining);
+    REGISTER_FUNCTION3(test_contains_value_greater_than);
+    REGISTER_FUNCTION3(testUsedIdsSpeed);
     REGISTER_FUNCTION(testSessionTakeoverOtherUsername);
     REGISTER_FUNCTION(testCorrelationData);
     REGISTER_FUNCTION(testSubscriptionIdOnlineClient);

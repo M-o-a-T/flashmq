@@ -12,8 +12,6 @@ See LICENSE for license details.
 
 #include <cassert>
 
-#include "mqttpacket.h"
-
 QueuedPublish::QueuedPublish(Publish &&publish, uint16_t packet_id, const std::optional<std::string> &topic_override) :
     publish(std::move(publish)),
     packet_id(packet_id),
@@ -47,12 +45,16 @@ size_t QueuedPublish::getApproximateMemoryFootprint() const
 
 void QoSPublishQueue::addToExpirationQueue(std::shared_ptr<QueuedPublish> &qp)
 {
+    if (!qp)
+        return;
+
     Publish &pub = qp->getPublish();
 
     if (!pub.expireInfo)
         return;
 
-    this->queueExpirations[pub.expireInfo->expiresAt()] = qp->getPacketId();
+    const auto when = std::chrono::time_point_cast<std::chrono::seconds>(pub.expiresAt().value());
+    this->queueExpirations.emplace(when, qp);
 }
 
 bool QoSPublishQueue::erase(const uint16_t packet_id)
@@ -63,13 +65,7 @@ bool QoSPublishQueue::erase(const uint16_t packet_id)
     if (pos != this->queue.end())
     {
         std::shared_ptr<QueuedPublish> &qp = pos->second;
-
-        const size_t mem = qp->getApproximateMemoryFootprint();
-        qosQueueBytes -= mem;
-        assert(qosQueueBytes >= 0);
-        if (qosQueueBytes < 0) // Should not happen, but correcting a hypothetical bug is fine for this purpose.
-            qosQueueBytes = 0;
-
+        subtractQoSBytes(qp.get());
         result = true;
         this->eraseFromMapAndRelinkList(pos);
     }
@@ -111,6 +107,8 @@ const std::shared_ptr<QueuedPublish> &QoSPublishQueue::getTail() const
     return tail;
 }
 
+#ifdef TESTING
+// This can't be used in the normal program because we don't have access to the used IDs here.
 std::shared_ptr<QueuedPublish> QoSPublishQueue::popNext()
 {
     std::shared_ptr<QueuedPublish> result = this->tail;
@@ -120,6 +118,7 @@ std::shared_ptr<QueuedPublish> QoSPublishQueue::popNext()
 
     return result;
 }
+#endif
 
 size_t QoSPublishQueue::size() const
 {
@@ -140,6 +139,33 @@ void QoSPublishQueue::addToHeadOfLinkedList(std::shared_ptr<QueuedPublish> &qp)
 
     if (!this->tail)
         this->tail = qp;
+}
+
+void QoSPublishQueue::recalculateQosQueueBytes()
+{
+    size_t new_value{};
+
+    for (const auto &x : queue)
+    {
+        if (!x.second)
+            continue;
+        new_value += x.second->getApproximateMemoryFootprint();
+    }
+
+    qosQueueBytes = { static_cast<ssize_t>(std::clamp<size_t>(new_value, 0, std::numeric_limits<ssize_t>::max())) };
+}
+
+void QoSPublishQueue::subtractQoSBytes(const QueuedPublish *p)
+{
+    if (!p)
+        return;
+
+    qosQueueBytes -= p->getApproximateMemoryFootprint();
+    assert(qosQueueBytes >= 0);
+
+    // Should not happen, but correcting a hypothetical bug is fine for this purpose.
+    if (qosQueueBytes < 0)
+        qosQueueBytes = 0;
 }
 
 /**
@@ -183,47 +209,40 @@ void QoSPublishQueue::queuePublish(Publish &&pub, uint16_t id, const std::option
     queue[id] = std::move(qp);
 }
 
-int QoSPublishQueue::clearExpiredMessages()
+std::vector<uint16_t> QoSPublishQueue::clearExpiredMessages()
 {
     if (this->queueExpirations.empty())
-        return 0;
+        return {};
 
     if (this->queueExpirations.begin()->first > std::chrono::steady_clock::now())
-        return 0;
+        return {};
 
-    int removed = 0;
+    std::vector<uint16_t> removed_ids;
 
-    auto it = queueExpirations.begin();
-    auto end = queueExpirations.end();
-    while (it != end)
+    for (auto _ = queueExpirations.begin(); _ != queueExpirations.end();)
     {
-        auto cur_it = it;
-        it++;
+        auto cur_it = _++;
 
-        const std::chrono::time_point<std::chrono::steady_clock> &when = cur_it->first;
-
-        if (when > std::chrono::steady_clock::now())
-        {
+        if (cur_it->first > std::chrono::steady_clock::now())
             break;
-        }
 
-        auto qpos = this->queue.find(cur_it->second);
+        const std::shared_ptr<QueuedPublish> qp = cur_it->second.lock();
+        queueExpirations.erase(cur_it);
 
-        if (qpos != this->queue.end())
+        if (!qp)
+            continue;
+
+        const auto qpos = this->queue.find(qp->getPacketId());
+
+        if (qpos != this->queue.end() && qpos->second == qp)
         {
-            std::shared_ptr<QueuedPublish> &p = qpos->second;
-
-            if (p->getPublish().hasExpired())
-            {
-                this->eraseFromMapAndRelinkList(qpos);
-
-                this->queueExpirations.erase(cur_it);
-                removed++;
-            }
+            removed_ids.push_back(qp->getPacketId());
+            subtractQoSBytes(qp.get());
+            this->eraseFromMapAndRelinkList(qpos);
         }
     }
 
-    return removed;
+    return removed_ids;
 }
 
 

@@ -19,6 +19,11 @@ See LICENSE for license details.
 #include "utils.h"
 #include "threadloop.h"
 
+void logStringStreamQueuedHelper(std::ostringstream &oss, Client *client)
+{
+    oss << client->repr();
+}
+
 KeepAliveCheck::KeepAliveCheck(const std::shared_ptr<Client> client) :
     client(client)
 {
@@ -53,7 +58,7 @@ ThreadData::ThreadData(int threadnr, const Settings &settings, const std::shared
 
     randomish.seed(get_random_int<unsigned long>());
 
-    std::array<int, 3> event_fds {taskEventFd, disconnectingAllEventFd, acceptQueue.event_fd.get()};
+    std::array<int, 3> event_fds {taskEventFd, disconnectingAllEventFd, pub->acceptQueue.event_fd.get()};
     for (int efd : event_fds)
     {
         struct epoll_event ev{};
@@ -76,6 +81,22 @@ ThreadData::~ThreadData()
 
 }
 
+void ThreadData::setName()
+{
+    this->thread_id = pthread_self();
+    std::string name("FlashMQ T " + std::to_string(this->threadnr));
+
+    if (!this->threadPrefix.empty())
+        name = this->threadPrefix + " T " + std::to_string(this->threadnr);
+
+    pthread_setname_np(this->thread_id, name.c_str());
+}
+
+void ThreadData::setThreadPrefix(const std::string &prefix)
+{
+    this->threadPrefix = prefix.substr(0, 8);
+}
+
 void ThreadData::quit()
 {
     running = false;
@@ -89,7 +110,7 @@ void ThreadData::quit()
  */
 void ThreadData::queuePublishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadData>> &threads)
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::publishStatsOnDollarTopic, this, threads);
     task_queue_locked->push_back(f);
@@ -99,7 +120,7 @@ void ThreadData::queuePublishStatsOnDollarTopic(std::vector<std::shared_ptr<Thre
 
 void ThreadData::queueSendingQueuedWills()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::sendQueuedWills, this);
     task_queue_locked->push_back(f);
@@ -109,7 +130,7 @@ void ThreadData::queueSendingQueuedWills()
 
 void ThreadData::queueRemoveExpiredSessions()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::removeExpiredSessions, this);
     task_queue_locked->push_back(f);
@@ -119,11 +140,10 @@ void ThreadData::queueRemoveExpiredSessions()
 
 void ThreadData::queuePurgeSubscriptionTree()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-    if (subscriptionStore->hasDeferredSubscriptionTreeNodesForPurging())
+    if (globals->subscriptionStore.hasDeferredSubscriptionTreeNodesForPurging())
         return;
 
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::purgeSubscriptionTree, this);
     task_queue_locked->push_back(f);
@@ -133,11 +153,10 @@ void ThreadData::queuePurgeSubscriptionTree()
 
 void ThreadData::queueRemoveExpiredRetainedMessages()
 {
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-    if (subscriptionStore->hasDeferredRetainedMessageNodesForPurging())
+    if (globals->subscriptionStore.hasDeferredRetainedMessageNodesForPurging())
         return;
 
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::removeExpiredRetainedMessages, this);
     task_queue_locked->push_back(f);
@@ -158,7 +177,7 @@ void ThreadData::queueClientNextKeepAliveCheck(std::shared_ptr<Client> &client, 
 
     KeepAliveCheck check(client);
     check.recheck = keepRechecking;
-    queuedKeepAliveChecks[when].push_back(check);
+    priv->queuedKeepAliveChecks[when].push_back(check);
 }
 
 
@@ -176,8 +195,6 @@ void ThreadData::continuationOfAuthentication(std::shared_ptr<Client> &client, A
 {
     assert(pthread_self() == thread_id);
 
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-
     if (authResult == AuthResult::auth_continue)
     {
         Auth auth(ReasonCodes::ContinueAuthentication, authMethod, returnData);
@@ -193,12 +210,12 @@ void ThreadData::continuationOfAuthentication(std::shared_ptr<Client> &client, A
 
             const std::shared_ptr<WillPublish> will = client->getStagedWill();
 
-            if (will && authentication.aclCheck(*will, will->payload, AclAccess::register_will) == AuthResult::success)
+            if (will && authentication.aclWriteCheck(*will, will->payload, AclAccess::register_will) == AuthResult::success)
             {
                 client->setWillFromStaged();
             }
 
-            subscriptionStore->registerClientAndKickExistingOne(client);
+            globals->subscriptionStore.registerClientAndKickExistingOne(client);
             client->sendConnackSuccess();
             client->setAuthenticated(true);
             client->getSession()->sendAllPendingQosData();
@@ -245,7 +262,7 @@ void ThreadData::bridgeReconnect()
     std::shared_ptr<BridgeState> bridge;
     std::shared_ptr<ThreadData> _threadData;
 
-    for (auto &pair : clients.bridges)
+    for (auto &pair : priv->clients.bridges)
     {
         bridge = pair.second;
 
@@ -331,7 +348,7 @@ void ThreadData::bridgeReconnect()
 
             logger->logf(LOG_NOTICE, "Connecting brige: %s", c->repr().c_str());
 
-            clients.by_fd[sockfd] = c;
+            priv->clients.by_fd[sockfd] = c;
 
             queueClientNextKeepAliveCheck(c, true);
 
@@ -342,8 +359,7 @@ void ThreadData::bridgeReconnect()
             }
             else
             {
-                std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-                session = subscriptionStore->getBridgeSession(c);
+                session = globals->subscriptionStore.getBridgeSession(c);
                 bridge->session = std::weak_ptr<Session>(session);
             }
 
@@ -365,7 +381,7 @@ void ThreadData::bridgeReconnect()
     if (requeue)
     {
         auto f = std::bind(&ThreadData::bridgeReconnect, this);
-        delayedTasks.addTask(f, 500);
+        pub->delayedTasks.addTask(f, 500);
     }
 }
 
@@ -381,7 +397,7 @@ void ThreadData::queueContinuationOfAuthentication(
 
     if (delay_in_ms == 0)
     {
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         wake_up_needed = task_queue_locked->empty();
         task_queue_locked->push_back(std::move(f));
     }
@@ -392,7 +408,7 @@ void ThreadData::queueContinuationOfAuthentication(
             this->addDelayedTask(f, delay_in_ms);
         };
 
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         wake_up_needed = task_queue_locked->empty();
         task_queue_locked->push_back(std::move(fdelayed));
     }
@@ -405,24 +421,20 @@ void ThreadData::clientDisconnectActions(
         bool authenticated, const std::string &clientid, std::shared_ptr<WillPublish> &willPublish, std::shared_ptr<Session> &session,
         std::weak_ptr<BridgeState> &bridgeState, const std::string &disconnect_reason)
 {
-    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
-
-    assert(store);
-
     publishBridgeState(bridgeState.lock(), false, disconnect_reason);
 
     if (willPublish)
     {
-        store->queueOrSendWillMessage(willPublish, session);
+        globals->subscriptionStore.queueOrSendWillMessage(willPublish, session);
     }
 
     if (session && session->getDestroyOnDisconnect())
     {
-        store->removeSession(session);
+        globals->subscriptionStore.removeSession(session);
     }
     else
     {
-        store->queueSessionRemoval(session);
+        globals->subscriptionStore.queueSessionRemoval(session);
     }
 
     if (authenticated)
@@ -438,7 +450,7 @@ void ThreadData::queueClientDisconnectActions(
                 std::move(session), std::move(bridgeState), disconnect_reason);
     assert(!willPublish);
     assert(!session);
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
     task_queue_locked->push_back(std::move(f));
 
     wakeUpThread();
@@ -449,7 +461,7 @@ void ThreadData::queueBridgeReconnect()
     auto f = std::bind(&ThreadData::bridgeReconnect, this);
 
     {
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         task_queue_locked->push_back(f);
     }
 
@@ -550,26 +562,30 @@ void ThreadData::publishStatsOnDollarTopic(std::vector<std::shared_ptr<ThreadDat
     publishStat("$SYS/broker/load/aclchecks/registerwill/total", aclRegisterWillCheckCount);
     publishStat("$SYS/broker/load/aclchecks/registerwill/persecond", static_cast<int64_t>(aclRegisterWillChecksPerSecond));
 
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
+    publishStat("$SYS/broker/retained messages/count", globals->subscriptionStore.getRetainedMessageCount());
+    publishStat("$SYS/broker/retained messages/node_count", globals->subscriptionStore.getRetainedNodeCount());
 
-    publishStat("$SYS/broker/retained messages/count", subscriptionStore->getRetainedMessageCount());
+    publishStat("$SYS/broker/sessions/total", globals->subscriptionStore.getSessionCount());
 
-    publishStat("$SYS/broker/sessions/total", subscriptionStore->getSessionCount());
-
-    publishStat("$SYS/broker/subscriptions/count", subscriptionStore->getSubscriptionCount());
+    publishStat("$SYS/broker/subscriptions/count", globals->subscriptionStore.getSubscriptionCount());
 
     for (auto &pair : globals->stats.getExtras())
     {
-        Publish p(pair.first, pair.second, 0);
-        publishWithAcl(p);
+        publishStat(pair.first, pair.second);
     }
 }
 
 void ThreadData::publishStat(const std::string &topic, int64_t n)
 {
     const std::string payload = std::to_string(n);
+    publishStat(topic, payload);
+}
+
+void ThreadData::publishStat(const std::string &topic, const std::string &payload)
+{
     Publish p(topic, payload, 0);
-    publishWithAcl(p, true);
+    p.setExpireAfter(60);
+    publishStatWithAcl(p, true);
 }
 
 void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool connected, const std::optional<std::string> &error)
@@ -584,10 +600,8 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
         ss << "$SYS/broker/bridge/" << bridge->c.clientidPrefix << "/connected";
         const std::string topic = ss.str();
 
-        globals->stats.setExtra(topic, payload);
-
-        Publish p(topic, payload, 0);
-        publishWithAcl(p, true);
+        globals->stats.setExtra(topic, payload, false);
+        publishStat(topic, payload);
     }
 
     {
@@ -595,33 +609,31 @@ void ThreadData::publishBridgeState(std::shared_ptr<BridgeState> bridge, bool co
         const std::string message = error.value_or(message_on_no_error);
         const std::string topic = "$SYS/broker/bridge/" + bridge->c.clientidPrefix + "/connection_status";
 
-        globals->stats.setExtra(topic, message);
-        Publish p(topic, message, 0);
-        publishWithAcl(p, true);
+        globals->stats.setExtra(topic, message, false);
+        publishStat(topic, message);
     }
 }
 
 void ThreadData::queueSettingRetainedMessage(const Publish &p, const std::vector<std::string> &subtopics, const std::chrono::time_point<std::chrono::steady_clock> limit)
 {
     assert(pthread_self() == thread_id);
-    const bool wakeup_required = this->queuedRetainedMessages.empty();
-    this->queuedRetainedMessages.emplace_front(p, subtopics, limit);
+    const bool wakeup_required = priv->queuedRetainedMessages.empty();
+    priv->queuedRetainedMessages.emplace_front(p, subtopics, limit);
     this->deferredRetainedMessagesSet.inc(1);
 
     if (wakeup_required)
         wakeUpThread();
 }
 
-void ThreadData::publishWithAcl(Publish &pub, bool setRetain)
+void ThreadData::publishStatWithAcl(Publish &pub, bool setRetain)
 {
-    authentication.aclCheck(pub, pub.payload, AclAccess::write);
+    authentication.aclWriteCheck(pub, pub.payload, AclAccess::write);
 
     PublishCopyFactory factory(&pub);
-    std::shared_ptr<SubscriptionStore> subscriptionStore = globals->subscriptionStore;
-    subscriptionStore->queuePacketAtSubscribers(factory, "", {}, true);
+    globals->subscriptionStore.queuePacketAtSubscribers(factory, "", {}, true);
 
     if (setRetain)
-        subscriptionStore->setRetainedMessage(pub, factory.getSubtopics());
+        globals->subscriptionStore.setRetainedMessage(pub, factory.getSubtopics(), true, false);
 }
 
 /**
@@ -630,7 +642,7 @@ void ThreadData::publishWithAcl(Publish &pub, bool setRetain)
  */
 void ThreadData::sendQueuedWills()
 {
-    globals->subscriptionStore->sendQueuedWillMessages();
+    globals->subscriptionStore.sendQueuedWillMessages();
 }
 
 /**
@@ -639,12 +651,12 @@ void ThreadData::sendQueuedWills()
  */
 void ThreadData::removeExpiredSessions()
 {
-    globals->subscriptionStore->removeExpiredSessionsClients();
+    globals->subscriptionStore.removeExpiredSessionsClients();
 }
 
 void ThreadData::purgeSubscriptionTree()
 {
-    bool done = globals->subscriptionStore->purgeSubscriptionTree();
+    bool done = globals->subscriptionStore.purgeSubscriptionTree();
 
     if (!done)
     {
@@ -659,7 +671,7 @@ void ThreadData::purgeSubscriptionTree()
  */
 void ThreadData::removeExpiredRetainedMessages()
 {
-    bool done = globals->subscriptionStore->expireRetainedMessages();
+    bool done = globals->subscriptionStore.expireRetainedMessages();
 
     if (!done)
     {
@@ -677,7 +689,7 @@ void ThreadData::sendAllWills()
 {
     assert(pthread_self() == thread_id);
 
-    for(auto &pair : clients.by_fd)
+    for(auto &pair : priv->clients.by_fd)
     {
         std::shared_ptr<Client> &c = pair.second;
         c->sendOrQueueWill();
@@ -691,10 +703,10 @@ void ThreadData::sendAllDisconnects()
     assert(pthread_self() == thread_id);
 
     std::vector<std::shared_ptr<Client>> clientsFound;
-    clientsFound.reserve(clients.by_fd.size());
+    clientsFound.reserve(priv->clients.by_fd.size());
 
     // We collect them first, so we are sure they are all added to 'disconnectingClients'.
-    for(auto &pair : clients.by_fd)
+    for(auto &pair : priv->clients.by_fd)
     {
         clientsFound.push_back(pair.second);
     }
@@ -707,7 +719,7 @@ void ThreadData::sendAllDisconnects()
     auto queued_collect_disconnecting_clients = [clientsFound, this](){
         for (const std::shared_ptr<Client> &c : clientsFound)
         {
-            this->disconnectingClients.push_back(c);
+            pub->disconnectingClients.push_back(c);
         }
 
         uint64_t one = 1;
@@ -720,7 +732,7 @@ void ThreadData::removeQueuedClients()
 {
     assert(pthread_self() == thread_id);
 
-    for (const std::weak_ptr<Client> &c : clientsQueuedForRemoving)
+    for (const std::weak_ptr<Client> &c : priv->clientsQueuedForRemoving)
     {
         std::shared_ptr<Client> client = c.lock();
 
@@ -728,19 +740,19 @@ void ThreadData::removeQueuedClients()
             continue;
 
         const int fd = client->getFd();
-        auto pos = clients.by_fd.find(fd);
-        if (pos != clients.by_fd.end() && pos->second == client)
+        auto pos = priv->clients.by_fd.find(fd);
+        if (pos != priv->clients.by_fd.end() && pos->second == client)
         {
-            clients.by_fd.erase(pos);
+            priv->clients.by_fd.erase(pos);
         }
     }
 
-    clientsQueuedForRemoving.clear();
+    priv->clientsQueuedForRemoving.clear();
 }
 
 void ThreadData::giveClient(std::shared_ptr<Client> &&client)
 {
-    acceptQueue.giveClient(std::move(client));
+    pub->acceptQueue.giveClient(std::move(client));
 }
 
 void ThreadData::giveBridge(std::shared_ptr<BridgeState> &bridgeState)
@@ -748,7 +760,7 @@ void ThreadData::giveBridge(std::shared_ptr<BridgeState> &bridgeState)
     if (!bridgeState)
         return;
 
-    acceptQueue.giveBridge(std::move(bridgeState));
+    pub->acceptQueue.giveBridge(std::move(bridgeState));
 }
 
 void ThreadData::removeBridgeQueued(const BridgeConfig &bridgeConfig, const std::string &reason)
@@ -761,13 +773,13 @@ void ThreadData::removeBridge(const BridgeConfig &bridgeConfig, const std::strin
 {
     assert(pthread_self() == thread_id);
 
-    auto pos = clients.bridges.find(bridgeConfig.clientidPrefix);
+    auto pos = priv->clients.bridges.find(bridgeConfig.clientidPrefix);
 
-    if (pos == clients.bridges.end())
+    if (pos == priv->clients.bridges.end())
         return;
 
     std::shared_ptr<BridgeState> bridge = pos->second;
-    clients.bridges.erase(pos);
+    priv->clients.bridges.erase(pos);
 
     if (!bridge)
         return;
@@ -793,7 +805,7 @@ void ThreadData::acceptPendingClients()
 {
     assert(pthread_self() == thread_id);
 
-    std::vector<std::shared_ptr<Client>> clientsToAccept = acceptQueue.takeClients();
+    std::vector<std::shared_ptr<Client>> clientsToAccept = pub->acceptQueue.takeClients();
 
     for (std::shared_ptr<Client> &client : clientsToAccept)
     {
@@ -806,7 +818,7 @@ void ThreadData::acceptPendingClients()
         queueClientNextKeepAliveCheck(client, false);
 
         client->addToEpoll(EPOLLIN);
-        clients.by_fd[fd] = std::move(client);
+        priv->clients.by_fd[fd] = std::move(client);
     }
 }
 
@@ -814,15 +826,15 @@ void ThreadData::acceptPendingBridges()
 {
     assert(pthread_self() == thread_id);
 
-    std::vector<std::shared_ptr<BridgeState>> bridgesToAccept = acceptQueue.takeBridges();
+    std::vector<std::shared_ptr<BridgeState>> bridgesToAccept = pub->acceptQueue.takeBridges();
 
     for (std::shared_ptr<BridgeState> &bridgeState : bridgesToAccept)
     {
         bridgeState->resetThreadOwners();
 
-        auto pos = clients.bridges.find(bridgeState->c.clientidPrefix);
+        auto pos = priv->clients.bridges.find(bridgeState->c.clientidPrefix);
 
-        if (pos != clients.bridges.end())
+        if (pos != priv->clients.bridges.end())
         {
             std::shared_ptr<BridgeState> &existingState = pos->second;
 
@@ -839,35 +851,24 @@ void ThreadData::acceptPendingBridges()
         }
         else
         {
-            clients.bridges[bridgeState->c.clientidPrefix] = bridgeState;
+            priv->clients.bridges[bridgeState->c.clientidPrefix] = bridgeState;
         }
     }
 }
 
-void ThreadData::deleteClients()
+void ThreadData::clear()
 {
-    // Can have shared pointers to clients
-    taskQueue.lock()->clear();
-    delayedTasks.clear();
-
-    clients.by_fd.clear();
-    clients.bridges.clear();
-    acceptQueue.clients.lock()->clear();
-    acceptQueue.bridges.lock()->clear();
+    pub.emplace();
+    priv.emplace();
 }
 
 void ThreadData::setQueuedRetainedMessages()
 {
-    if (this->queuedRetainedMessages.empty())
+    if (priv->queuedRetainedMessages.empty())
         return;
 
-    std::shared_ptr<SubscriptionStore> store = globals->subscriptionStore;
-
-    if (!store)
-        return;
-
-    auto _pos = this->queuedRetainedMessages.begin();
-    while (_pos != this->queuedRetainedMessages.end())
+    auto _pos = priv->queuedRetainedMessages.begin();
+    while (_pos != priv->queuedRetainedMessages.end())
     {
         auto cur = _pos;
         _pos++;
@@ -879,9 +880,9 @@ void ThreadData::setQueuedRetainedMessages()
             deferredRetainedMessagesSetTimeout.inc(1);
         }
 
-        if (store->setRetainedMessage(cur->p, cur->subtopics, try_lock_fail))
+        if (globals->subscriptionStore.setRetainedMessage(cur->p, cur->subtopics, false, try_lock_fail))
         {
-            this->queuedRetainedMessages.erase(cur);
+            priv->queuedRetainedMessages.erase(cur);
             continue;
         }
         else
@@ -894,12 +895,12 @@ void ThreadData::setQueuedRetainedMessages()
 
 bool ThreadData::queuedRetainedMessagesEmpty() const
 {
-    return queuedRetainedMessages.empty();
+    return priv->queuedRetainedMessages.empty();
 }
 
 void ThreadData::clearQueuedRetainedMessages()
 {
-    queuedRetainedMessages.clear();
+    priv->queuedRetainedMessages.clear();
 }
 
 void ThreadData::queueInternalHeartbeat()
@@ -913,7 +914,7 @@ void ThreadData::queueInternalHeartbeat()
 
     {
         auto bound = std::bind(f, std::chrono::steady_clock::now());
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         task_queue_locked->push_back(bound);
     }
 
@@ -924,9 +925,9 @@ std::shared_ptr<Client> ThreadData::getClient(int fd)
 {
     assert(pthread_self() == thread_id);
 
-    auto pos = clients.by_fd.find(fd);
+    auto pos = priv->clients.by_fd.find(fd);
 
-    if (pos == clients.by_fd.end())
+    if (pos == priv->clients.by_fd.end())
         return std::shared_ptr<Client>();
 
     return pos->second;
@@ -940,36 +941,40 @@ void ThreadData::removeClientQueued(const std::shared_ptr<Client> &client)
 
     bool wakeUpNeeded = true;
 
-    wakeUpNeeded = clientsQueuedForRemoving.empty();
-    clientsQueuedForRemoving.push_front(client);
+    wakeUpNeeded = priv->clientsQueuedForRemoving.empty();
+    priv->clientsQueuedForRemoving.push_front(client);
 
     if (wakeUpNeeded)
     {
         auto f = std::bind(&ThreadData::removeQueuedClients, this);
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         task_queue_locked->push_back(f);
 
         wakeUpThread();
     }
 }
 
-void ThreadData::removeClientQueued(int fd)
+void ThreadData::removeClientQueued(int fd, const Client *client, const std::string &reason)
 {
-    auto f = [this, fd] {
+    auto f = [this, fd, client, reason] {
         bool wakeUpNeeded = true;
         std::shared_ptr<Client> clientFound;
 
-        auto client_it = clients.by_fd.find(fd);
-        if (client_it != clients.by_fd.end())
+        auto client_it = priv->clients.by_fd.find(fd);
+        if (client_it != priv->clients.by_fd.end())
         {
             clientFound = client_it->second;
         }
 
-        if (!clientFound)
+        // Raw client pointer only for checking; don't dereference.
+        if (!clientFound || clientFound.get() != client)
             return;
 
-        wakeUpNeeded = clientsQueuedForRemoving.empty();
-        clientsQueuedForRemoving.push_front(std::move(clientFound));
+        if (!reason.empty())
+            clientFound->setDisconnectReason(reason);
+
+        wakeUpNeeded = priv->clientsQueuedForRemoving.empty();
+        priv->clientsQueuedForRemoving.push_front(std::move(clientFound));
 
         if (!wakeUpNeeded)
             return;
@@ -991,9 +996,9 @@ void ThreadData::removeClient(std::shared_ptr<Client> client)
 
     client->setDisconnectStage(DisconnectStage::Now);
 
-    auto pos = clients.by_fd.find(client->getFd());
-    if (pos != clients.by_fd.end() && pos->second == client)
-        clients.by_fd.erase(pos);
+    auto pos = priv->clients.by_fd.find(client->getFd());
+    if (pos != priv->clients.by_fd.end() && pos->second == client)
+        priv->clients.by_fd.erase(pos);
 }
 
 void ThreadData::serverInitiatedDisconnect(std::shared_ptr<Client> &&client, ReasonCodes reason, const std::string &reason_text)
@@ -1056,7 +1061,7 @@ void ThreadData::serverInitiatedDisconnect(const std::shared_ptr<Client> &client
 
 void ThreadData::queueDoKeepAliveCheck()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::doKeepAliveCheck, this);
     task_queue_locked->push_back(f);
@@ -1066,7 +1071,7 @@ void ThreadData::queueDoKeepAliveCheck()
 
 void ThreadData::queueQuit()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::quit, this);
     task_queue_locked->push_back(f);
@@ -1078,7 +1083,7 @@ void ThreadData::queueQuit()
 
 void ThreadData::queuePasswdFileReload()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&Authentication::loadMosquittoPasswordFile, &authentication);
     task_queue_locked->push_back(f);
@@ -1096,12 +1101,12 @@ size_t ThreadData::getNrOfClients()
 
 void ThreadData::updateNrOfClients()
 {
-    this->clientCount.store(clients.by_fd.size(), std::memory_order_relaxed);
+    this->clientCount.store(priv->clients.by_fd.size(), std::memory_order_relaxed);
 }
 
 void ThreadData::queuepluginPeriodicEvent()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::pluginPeriodicEvent, this);
     task_queue_locked->push_back(f);
@@ -1116,7 +1121,7 @@ void ThreadData::pluginPeriodicEvent()
 
 void ThreadData::queueSendWills()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::sendAllWills, this);
     task_queue_locked->push_back(f);
@@ -1126,7 +1131,7 @@ void ThreadData::queueSendWills()
 
 void ThreadData::queueSendDisconnects()
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::sendAllDisconnects, this);
     task_queue_locked->push_back(f);
@@ -1137,17 +1142,16 @@ void ThreadData::queueSendDisconnects()
 void ThreadData::pollExternalFd(int fd, uint32_t events, const std::weak_ptr<void> &p)
 {
     int mode = EPOLL_CTL_MOD;
-    auto pos = externalFds.find(fd);
-    if (pos == externalFds.end())
+    auto pos = pub->externalFds.find(fd);
+    if (pos == pub->externalFds.end())
     {
         mode = EPOLL_CTL_ADD;
     }
 
     if (mode == EPOLL_CTL_ADD || !p.expired())
-        externalFds[fd] = p;
+        pub->externalFds[fd] = p;
 
-    struct epoll_event ev;
-    memset(&ev, 0, sizeof (struct epoll_event));
+    struct epoll_event ev {};
     ev.data.fd = fd;
     ev.events = events;
     check<std::runtime_error>(epoll_ctl(this->epollfd.get(), mode, fd, &ev));
@@ -1155,7 +1159,7 @@ void ThreadData::pollExternalFd(int fd, uint32_t events, const std::weak_ptr<voi
 
 void ThreadData::pollExternalRemove(int fd)
 {
-    this->externalFds.erase(fd);
+    pub->externalFds.erase(fd);
     if (epoll_ctl(this->epollfd.get(), EPOLL_CTL_DEL, fd, NULL) != 0)
     {
         Logger *logger = Logger::getInstance();
@@ -1165,12 +1169,12 @@ void ThreadData::pollExternalRemove(int fd)
 
 uint32_t ThreadData::addDelayedTask(std::function<void ()> f, uint32_t delayMs)
 {
-    return delayedTasks.addTask(f, delayMs);
+    return pub->delayedTasks.addTask(f, delayMs);
 }
 
 void ThreadData::removeDelayedTask(uint32_t id)
 {
-    delayedTasks.eraseTask(id);
+    pub->delayedTasks.eraseTask(id);
 }
 
 void ThreadData::addImmediateTask(std::function<void ()> f)
@@ -1178,7 +1182,7 @@ void ThreadData::addImmediateTask(std::function<void ()> f)
     bool wakeupNeeded = true;
 
     {
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         wakeupNeeded = task_queue_locked->empty();
         task_queue_locked->push_back(f);
     }
@@ -1198,7 +1202,7 @@ void ThreadData::performAllImmediateTasks()
     std::list<std::function<void()>> copiedTasks;
 
     {
-        auto task_queue_locked = taskQueue.lock();
+        auto task_queue_locked = pub->taskQueue.lock();
         copiedTasks = std::move(*task_queue_locked);
         task_queue_locked->clear();
     }
@@ -1239,10 +1243,10 @@ void ThreadData::doKeepAliveCheck()
         {
             logger->logf(LOG_DEBUG, "Checking clients with pending keep-alive checks in thread %d", threadnr);
 
-            slotsTotal = queuedKeepAliveChecks.size();
+            slotsTotal = priv->queuedKeepAliveChecks.size();
 
-            auto pos = queuedKeepAliveChecks.begin();
-            while (pos != queuedKeepAliveChecks.end())
+            auto pos = priv->queuedKeepAliveChecks.begin();
+            while (pos != priv->queuedKeepAliveChecks.end())
             {
                 const std::chrono::seconds &doCheckAt = pos->first;
 
@@ -1276,7 +1280,7 @@ void ThreadData::doKeepAliveCheck()
                     }
                 }
 
-                pos = queuedKeepAliveChecks.erase(pos);
+                pos = priv->queuedKeepAliveChecks.erase(pos);
             }
 
             for (std::shared_ptr<Client> &c : clientsToRecheck)
@@ -1292,7 +1296,7 @@ void ThreadData::doKeepAliveCheck()
         for (std::shared_ptr<Client> c : clientsToRemove)
         {
             c->setDisconnectReason("Keep-alive expired: " + c->getKeepAliveInfoString());
-            clients.by_fd.erase(c->getFd());
+            priv->clients.by_fd.erase(c->getFd());
         }
     }
     catch (std::exception &ex)
@@ -1326,7 +1330,7 @@ void ThreadData::reload(const Settings &settings)
         // Because the auth plugin has a reference to it, it will also be updated.
         settingsLocalCopy = settings;
 
-        for (auto &pair : clients.bridges)
+        for (auto &pair : priv->clients.bridges)
         {
             std::shared_ptr<BridgeState> b = pair.second;
 
@@ -1347,7 +1351,7 @@ void ThreadData::reload(const Settings &settings)
 
 void ThreadData::queueReload(const Settings &settings)
 {
-    auto task_queue_locked = taskQueue.lock();
+    auto task_queue_locked = pub->taskQueue.lock();
 
     auto f = std::bind(&ThreadData::reload, this, settings);
     task_queue_locked->push_back(f);
@@ -1363,7 +1367,9 @@ void ThreadData::wakeUpThread()
 
 
 ThreadDataOwner::ThreadDataOwner(int threadnr, const Settings &settings, const std::shared_ptr<PluginLoader> &pluginLoader, const std::weak_ptr<MainApp> mainApp) :
-    td(std::make_shared<ThreadData>(threadnr, settings, pluginLoader, mainApp))
+    threadnr(threadnr),
+    td(std::make_shared<ThreadData>(threadnr, settings, pluginLoader, mainApp)),
+    td_weak(td)
 {
 
 }
@@ -1375,16 +1381,7 @@ ThreadDataOwner::~ThreadDataOwner()
 
 void ThreadDataOwner::start()
 {
-    this->thread = std::thread(&do_thread_work, td);
-
-    pthread_t native = this->thread.native_handle();
-    td->thread_id = native;
-    std::ostringstream threadName;
-    threadName << "FlashMQ T " << td->threadnr;
-    threadName.flush();
-    std::string name = threadName.str();
-    const char *c_str = name.c_str();
-    pthread_setname_np(native, c_str);
+    this->thread = std::thread(&do_thread_work, std::move(td));
 }
 
 void ThreadDataOwner::waitForQuit()
@@ -1393,12 +1390,59 @@ void ThreadDataOwner::waitForQuit()
         thread.join();
 }
 
-ThreadData *ThreadDataOwner::operator->() const
-{
-    return td.get();
-}
-
 std::shared_ptr<ThreadData> ThreadDataOwner::getThreadData() const
 {
-    return td;
+    auto result = td_weak.lock();
+    if (!result)
+        throw std::runtime_error("ThreadDataOwner::getThreadData() null");
+    return result;
 }
+
+bool ThreadDataOwner::running() const
+{
+    auto t = td_weak.lock();
+    if (!t)
+        return false;
+    return t->running;
+}
+
+bool ThreadDataOwner::finished() const
+{
+    auto t = td_weak.lock();
+    if (!t)
+        return true;
+    return t->finished;
+}
+
+bool ThreadDataOwner::notAllWillQueuedButStillRunning() const
+{
+    auto t = td_weak.lock();
+    if (!t)
+        return false;
+    return !t->allWillsQueued && t->running;
+}
+
+std::chrono::milliseconds ThreadDataOwner::getDrift() const
+{
+    auto t = td_weak.lock();
+    if (!t)
+        return std::chrono::milliseconds(0);
+    return t->driftCounter.getAvgDrift();
+}
+
+void ThreadDataOwner::setThreadPrefix(const std::string prefix)
+{
+    auto t = td_weak.lock();
+    if (!t)
+        return;
+
+    t->setThreadPrefix(prefix);
+}
+
+
+
+
+
+
+
+

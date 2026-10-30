@@ -139,8 +139,7 @@ void ConfigFileParser::checkFileExistsAndReadable(const std::string &key, const 
         throw ConfigFileException(oss.str());
     }
 
-    struct stat statbuf;
-    memset(&statbuf, 0, sizeof(struct stat));
+    struct stat statbuf {};
     if (stat(pathToCheck.c_str(), &statbuf) < 0)
         throw ConfigFileException(formatString("Reading stat of '%s' failed.", pathToCheck.c_str()));
 
@@ -177,8 +176,7 @@ void ConfigFileParser::checkFileOrItsDirWritable(const std::string &filepath)
 
 void ConfigFileParser::checkDirExists(const std::string &key, const std::string &dir)
 {
-    struct stat statbuf;
-    memset(&statbuf, 0, sizeof(struct stat));
+    struct stat statbuf {};
     if (stat(dir.c_str(), &statbuf) < 0)
         throw ConfigFileException(formatString("Error for '%s': path '%s' does not exist or reading stat failed.", key.c_str(), dir.c_str()));
 
@@ -219,6 +217,10 @@ ConfigFileParser::ConfigFileParser(const std::string &path) :
     validKeys.insert("wills_enabled");
     validKeys.insert("retained_messages_mode");
     validKeys.insert("retained_messages_node_limit");
+    validKeys.insert("retained_messages_node_creation_limit_enforcement_mode");
+    validKeys.insert("retained_messages_node_creation_limit_enforcement_depth");
+    validKeys.insert("retained_messages_node_creation_limit");
+    validKeys.insert("retained_message_max_payload_size");
     validKeys.insert("expire_retained_messages_after_seconds");
     validKeys.insert("retained_message_node_lifetime");
     validKeys.insert("expire_retained_messages_time_budget_ms");
@@ -1243,6 +1245,36 @@ void ConfigFileParser::loadFile(bool test)
                         throw ConfigFileException("Set '" + key + "' higher than 0, or use 'retained_messages_mode'.");
 
                     tmpSettings.retainedMessagesNodeLimit = newVal;
+                }
+
+                if (testKeyValidity(key, "retained_messages_node_creation_limit_enforcement_mode", validKeys))
+                {
+                    const std::string _val = str_tolower(value);
+
+                    if (_val == "reject")
+                        tmpSettings.retainedMessagesNodeCreationLimitEnforcementMode = RetainedMessagesNodeCreationLimitEnforcementMode::Reject;
+                    else if (_val == "log")
+                        tmpSettings.retainedMessagesNodeCreationLimitEnforcementMode = RetainedMessagesNodeCreationLimitEnforcementMode::Log;
+                    else
+                        throw ConfigFileException(formatString("Value '%s' for '%s' is invalid.", value.c_str(), key.c_str()));
+                }
+
+                if (testKeyValidity(key, "retained_messages_node_creation_limit_enforcement_depth", validKeys))
+                {
+                    const ssize_t newVal{value_to_int_ranged<uint16_t>(key, value)};
+                    tmpSettings.retainedMessagesNodeCreationLimitEnforcementDepth = newVal;
+                }
+
+                if (testKeyValidity(key, "retained_messages_node_creation_limit", validKeys))
+                {
+                    const ssize_t newVal{value_to_int_ranged<uint32_t>(key, value, 1)};
+                    tmpSettings.retainedMessagesNodeCreationLimit = newVal;
+                }
+
+                if (testKeyValidity(key, "retained_message_max_payload_size", validKeys))
+                {
+                    const size_t newVal{value_to_int_ranged<uint32_t>(key, value, 1)};
+                    tmpSettings.retainedMessageMaxPayloadSize = newVal;
                 }
 
                 if (testKeyValidity(key, "minimum_wildcard_subscription_depth", validKeys))

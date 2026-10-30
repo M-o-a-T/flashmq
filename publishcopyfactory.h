@@ -19,6 +19,13 @@ See LICENSE for license details.
 #include "forward_declarations.h"
 #include "types.h"
 
+struct AclReadCheckResult
+{
+    AuthResult auth_result = AuthResult::error;
+    uint8_t effective_qos = 0;
+    bool effective_retain = false;
+};
+
 /**
  * @brief The PublishCopyFactory class is for managing copies of an incoming publish, including sometimes not making copies at all.
  *
@@ -40,7 +47,14 @@ public:
     PublishCopyFactory(MqttPacket *packet);
     PublishCopyFactory(Publish *publish);
     PublishCopyFactory(const PublishCopyFactory &other) = delete;
-    PublishCopyFactory(PublishCopyFactory &&other) = delete;
+    PublishCopyFactory &operator=(const PublishCopyFactory&) = delete;
+
+    void* operator new(size_t) = delete;
+    void operator delete(void*) = delete;
+    void* operator new[](size_t) = delete;
+    void operator delete[](void*) = delete;
+    void* operator new(size_t, void*) = delete;
+    void* operator new[](size_t, void*) = delete;
 
     MqttPacket *getOptimumPacket(
         const uint8_t max_qos, const ProtocolVersion protocolVersion, uint16_t topic_alias, bool skip_topic, uint32_t subscriptionIdentifier,
@@ -58,6 +72,7 @@ public:
     const std::optional<std::string> &getContentType() const;
     const std::optional<std::chrono::time_point<std::chrono::steady_clock>> getExpiresAt() const;
     static int getPublishLayoutCompareKey(ProtocolVersion pv, uint8_t qos);
+    AclReadCheckResult aclReadCheck(const std::string client_id, const std::string &username, const uint8_t max_qos, const bool retainAsPublished);
 };
 
 #endif // PUBLISHCOPYFACTORY_H

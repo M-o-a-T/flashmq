@@ -11,7 +11,6 @@ See LICENSE for license details.
 #ifndef QOSPACKETQUEUE_H
 #define QOSPACKETQUEUE_H
 
-#include <list>
 #include <map>
 
 #include "types.h"
@@ -52,13 +51,15 @@ class QoSPublishQueue
     std::shared_ptr<QueuedPublish> tail;
 
     std::unordered_map<uint16_t, std::shared_ptr<QueuedPublish>> queue;
-    std::map<std::chrono::time_point<std::chrono::steady_clock>, uint16_t> queueExpirations;
+    std::multimap<std::chrono::time_point<std::chrono::steady_clock, std::chrono::seconds>, std::weak_ptr<QueuedPublish>> queueExpirations;
 
     ssize_t qosQueueBytes = 0;
 
     void addToExpirationQueue(std::shared_ptr<QueuedPublish> &qp);
     void eraseFromMapAndRelinkList(std::unordered_map<uint16_t, std::shared_ptr<QueuedPublish>>::iterator pos);
     void addToHeadOfLinkedList(std::shared_ptr<QueuedPublish> &qp);
+    void recalculateQosQueueBytes();
+    void subtractQoSBytes(const QueuedPublish *p);
 
 public:
     QoSPublishQueue() = default;
@@ -77,9 +78,11 @@ public:
         PublishCopyFactory &copyFactory, uint16_t id, uint8_t new_max_qos, bool retainAsPublished, const uint32_t subscriptionIdentifier,
         const std::optional<std::string> &topic_override);
     void queuePublish(Publish &&pub, uint16_t id, const std::optional<std::string> &topic_override);
-    int clearExpiredMessages();
+    std::vector<uint16_t> clearExpiredMessages();
     const std::shared_ptr<QueuedPublish> &getTail() const;
+#ifdef TESTING
     std::shared_ptr<QueuedPublish> popNext();
+#endif
 
 };
 

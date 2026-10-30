@@ -33,6 +33,7 @@ See LICENSE for license details.
 #include "fdmanaged.h"
 #include "mutexowned.h"
 #include "fmqssl.h"
+#include "threaddata.h"
 
 #include "publishcopyfactory.h"
 
@@ -80,8 +81,17 @@ class Client
     {
         CirBuf buf;
         bool readyForWriting = false;
+        std::optional<std::chrono::time_point<std::chrono::steady_clock>> pressuredAt;
 
-        WriteBuf(size_t size);
+        uint32_t maxOutgoingPacketSize {};
+        std::optional<uint32_t> maxBufSizeOverride;
+
+        WriteBuf(size_t size, uint32_t maxOutgoingPacketSize);
+
+        void checkPressure(const size_t limit, Client *client);
+        void checkPressure(Client *client);
+        void forceResetUnderPressureWhenEmpty();
+        uint32_t getMaxBufSize() const;
     };
 
     friend class IoWrapper;
@@ -91,9 +101,9 @@ class Client
 
     ProtocolVersion protocolVersion = ProtocolVersion::None;
 
-    uint32_t maxOutgoingPacketSize;
     const uint32_t maxIncomingPacketSize;
-    std::optional<uint32_t> maxBufSizeOverride;
+    std::optional<uint32_t> maxReadBufSizeOverride;
+
     uint8_t maxQos = 2;
     Mqtt3QoSExceedAction mqtt3QoSExceedAction = Mqtt3QoSExceedAction::Disconnect;
 
@@ -122,6 +132,7 @@ class Client
     std::string clientid;
     std::string username;
     std::optional<std::string> fmq_client_group_id;
+    std::optional<std::string> client_id_prefix;
     uint16_t keepalive = 10;
     bool clean_start = false;
     X509ClientVerification x509ClientVerification = X509ClientVerification::None;
@@ -209,7 +220,9 @@ public:
     bool hasConnectPacketSeen() { return connectPacketSeen; }
     void setHasConnectPacketSeen() { connectPacketSeen = true; }
     const std::string &getClientId() { return this->clientid; }
+    std::string getClientIdOrPrefix() const;
     void setClientId(const std::string &id);
+    void setClientIdPrefix(const std::optional<std::string> &p);
     const std::string &getUsername() const { return this->username; }
     const std::optional<std::string> &getFmqClientGroupId() const { return this->fmq_client_group_id; }
     std::string &getMutableUsername();
@@ -303,7 +316,16 @@ public:
     uint8_t getMaxQos() const { return this->maxQos; }
     void setMaxQos(uint8_t qos) { this->maxQos = qos; }
 
+    template<typename... Args>
+    void logFormatStringQueued(int level, Args... args)
+    {
+        auto td = this->threadData.lock();
 
+        if (!td)
+            return;
+
+        td->logStringQueued(fd.get(), this, level, args...);
+    }
 };
 
 #endif // CLIENT_H

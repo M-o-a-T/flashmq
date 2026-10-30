@@ -191,8 +191,8 @@ class Authentication
     const std::string mosquittoPasswordFile;
     const std::string mosquittoAclFile;
 
-    struct timespec mosquittoPasswordFileLastLoad;
-    struct timespec mosquittoAclFileLastChange;
+    struct timespec mosquittoPasswordFileLastLoad {};
+    struct timespec mosquittoAclFileLastChange {};
 
     std::unique_ptr<std::unordered_map<std::string, MosquittoPasswordFileEntry>> mosquittoPasswordEntries;
     std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> mosquittoDigestContext;
@@ -215,7 +215,7 @@ public:
         const std::shared_ptr<Session> &session, const std::string &clientid,
         const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
         const std::string &shareName, const std::vector<std::pair<std::string, std::string>> *userProperties) const;
-    AuthResult aclCheck(Publish &publishData, std::string_view payload, AclAccess access = AclAccess::write);
+    AuthResult aclWriteCheck(Publish &publishData, std::string_view payload, AclAccess access = AclAccess::write);
     AuthResult aclCheck(
             const std::string &clientid, const std::string &username, const std::string &topic, const std::vector<std::string> &subtopics,
             const std::string &sharename, std::string_view payload, AclAccess access, uint8_t qos, bool retain, const std::optional<std::string> &correlationData,
