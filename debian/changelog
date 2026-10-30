@@ -1,0 +1,48 @@
+flashmq (1.26.1-2) stable; urgency=medium
+
+  * Install flashmq_public.h
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Wed, 29 Apr 2026 06:20:21 +0200
+
+flashmq (1.26.1-1) stable; urgency=medium
+
+  * Upstream merge.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Tue, 28 Apr 2026 21:51:47 +0200
+
+flashmq (1.26.0-1) stable; urgency=medium
+
+  * Upstream merge.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Wed, 18 Mar 2026 18:19:52 +0100
+
+flashmq (1.23.2-1) stable; urgency=medium
+
+  * Upstream merge.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Sat, 01 Nov 2025 12:50:36 +0100
+
+flashmq (1.21.1-2) unstable; urgency=medium
+
+  * Fix systemd unit installation
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 12 May 2025 05:32:24 +0200
+
+flashmq (1.21.1-1) unstable; urgency=medium
+
+  * Upstream merge.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Sun, 27 Apr 2025 10:35:35 +0200
+
+flashmq (1.20.0-2) unstable; urgency=medium
+
+  * Add preinst to create /var/lib/flashmq
+  * log to stdout (= journal)
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Sat, 26 Apr 2025 18:03:20 +0200
+
+flashmq (1.20.0-1) unstable; urgency=medium
+
+  * Initial release. (Closes: #1100047)
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 10 Mar 2025 16:18:01 +0100

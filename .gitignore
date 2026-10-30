@@ -4,6 +4,7 @@ FlashMQBuild*
 *.swp
 compile_commands.json
 .clangd/
+/obj-*
 .cache/
 build
 FlashMQTests/build

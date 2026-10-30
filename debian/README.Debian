@@ -1,0 +1,8 @@
+flashmq for Debian
+------------------
+
+FlashMQ does not yet support proper systemd startup. You might want to add
+a dependency on a small program that retries connecting to MQTT until
+it's successful.
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 10 Mar 2025 16:18:01 +0100
